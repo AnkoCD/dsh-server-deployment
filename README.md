@@ -1,4 +1,4 @@
-# DeepSeek Harness 多用户网关（dsh-multi-user-gateway）
+# DeepSeek Harness 服务器部署（dsh-server-deployment）
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）Web 端增加**多用户门户**的零依赖 Node 网关：登录认证、每用户独立 DSH 实例与 OS 级数据隔离、每用户独立 API Key，以及内置的**交付文件抽屉**（下载 / 上传 / 当前工作区自动定位）。
 
