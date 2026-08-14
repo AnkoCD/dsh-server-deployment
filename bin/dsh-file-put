@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# dsh-file-put <home> <dir> <name> -- write stdin into <dir>/<name>, owned like <dir>.
+# Invoked via sudo (see /etc/sudoers.d/dsh-upload) by the gateway for web uploads.
+set -euo pipefail
+home="$1"
+dir="$2"
+name="$3"
+MAX_BYTES=110000000
+case "$name" in
+  ''|'.'|'..'|*/*|*\\*|*$'\n'*|*$'\r'*) exit 2 ;;
+esac
+case "$name" in .*) exit 2 ;; esac
+[ "${#name}" -le 200 ] || exit 2
+hd="$(realpath "$home")" || exit 3
+[ -d "$dir" ] || exit 4
+pd="$(realpath "$dir")" || exit 3
+case "$pd" in "$hd"|"$hd"/*) ;; *) exit 3 ;; esac
+tmp="$(mktemp "$pd/.dsh-up.XXXXXX")" || exit 4
+trap 'rm -f "$tmp"' EXIT
+cat > "$tmp"
+if [ "$(stat -c%s "$tmp")" -gt "$MAX_BYTES" ]; then exit 5; fi
+chown --reference="$pd" "$tmp"
+chmod 0644 "$tmp"
+mv -f "$tmp" "$pd/$name"
+trap - EXIT
+exit 0

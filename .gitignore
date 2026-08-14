@@ -1,0 +1,9 @@
+# Runtime state and secrets must never be committed
+node_modules/
+*.log
+secret
+users.json
+state-cwd.json
+.credentials.yaml
+.htpasswd*
+*.bak

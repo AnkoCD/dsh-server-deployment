@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# dsh-file-list <home> [dir] -- JSON directory listing inside <home>.
+# exit: 2 usage, 3 out of scope, 4 missing/not a directory.
+exec /opt/deepseek-harness/runtime/bin/node /opt/deepseek-harness/bin/dsh-file-list.js "$@"
