@@ -8,6 +8,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/deepseek-harness/gateway
+EnvironmentFile=/opt/ipollowork/ipollowork-secrets.env
 Environment=HOST=127.0.0.1
 Environment=PORT=3081
 Environment=USERS_FILE=/opt/deepseek-harness/gateway/users.json
@@ -16,6 +17,8 @@ Environment=USERS_DIR=/opt/deepseek-harness/users
 Environment=DEEPSEEK_BASE_URL=https://api.deepseek.com
 Environment=COOKIE_SECURE=1
 Environment=SESSION_TTL=43200
+Environment=IPOLLOWORK_BACKEND=127.0.0.1:8787
+Environment=IPOLLOWORK_BASE=/ipollowork
 ExecStart=/opt/deepseek-harness/runtime/bin/node /opt/deepseek-harness/gateway/server.js
 Restart=on-failure
 RestartSec=3

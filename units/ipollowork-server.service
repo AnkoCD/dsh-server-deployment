@@ -1,0 +1,24 @@
+[Unit]
+Description=iPolloWork Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/ipollowork
+EnvironmentFile=/opt/ipollowork/ipollowork-secrets.env
+Environment=IPOLLOWORK_HOST=127.0.0.1
+Environment=IPOLLOWORK_PORT=8787
+Environment=IPOLLOWORK_APPROVAL_MODE=auto
+Environment=IPOLLOWORK_WORKSPACES=/opt/ipollowork/workspace
+Environment=HOME=/opt/ipollowork
+Environment=IPOLLOWORK_BUNDLED_PLUGIN_PACKAGES_DIR=/opt/ipollowork/bundled-plugin-packages
+Environment=DSH_RUNTIME_BIN=/opt/ipollowork/runtime/dsh-jsonrpc-agent-pkg-linux-x64
+ExecStart=/opt/ipollowork/ipollowork-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

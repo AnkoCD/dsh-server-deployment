@@ -30,6 +30,18 @@ const FILE_READ_HELPER = process.env.FILE_READ_HELPER || '/opt/deepseek-harness/
 const FILE_LIST_HELPER = process.env.FILE_LIST_HELPER || '/opt/deepseek-harness/bin/dsh-file-list';
 const UPLOAD_MAX_MB = parseInt(process.env.UPLOAD_MAX_MB || '100', 10);
 
+// ---------- iPolloWork backend proxy ----------
+// iPolloWork is a separate visual-AI workbench server kept loopback-only. It is
+// exposed publicly through this gateway under /ipollowork/*, gated by the same
+// DSH account system (a valid session cookie). The gateway injects the client
+// and host tokens server-side so the backend never binds a public socket and
+// the secrets never reach the browser.
+const IPOLLOWORK_ENABLED = (process.env.IPOLLOWORK_ENABLED || '1') !== '0';
+const IPOLLOWORK_BASE = (process.env.IPOLLOWORK_BASE || '/ipollowork').replace(/\/+$/, '');
+const IPOLLOWORK_BACKEND = process.env.IPOLLOWORK_BACKEND || '127.0.0.1:8787';
+const IPOLLOWORK_CLIENT_TOKEN = process.env.IPOLLOWORK_TOKEN || '';
+const IPOLLOWORK_HOST_TOKEN = process.env.IPOLLOWORK_HOST_TOKEN || '';
+
 // ---------- history page trimming + JSON gzip tuning ----------
 // Huge agent sessions accumulate tens of thousands of streaming chunk events
 // per page: the DSH host pages by *messages* (user/message, assistant/message)
@@ -785,6 +797,90 @@ function proxyUpgrade(req, socket, head, port) {
   upstream.on('close', () => socket.destroy());
 }
 
+// ---------- iPolloWork reverse proxy ----------
+function ipolloBackend() {
+  const i = IPOLLOWORK_BACKEND.lastIndexOf(':');
+  if (i <= 0) return { host: IPOLLOWORK_BACKEND || '127.0.0.1', port: 8787 };
+  const host = IPOLLOWORK_BACKEND.slice(0, i);
+  const port = parseInt(IPOLLOWORK_BACKEND.slice(i + 1), 10);
+  return { host: host || '127.0.0.1', port: Number.isFinite(port) ? port : 8787 };
+}
+// Rewrite the external /ipollowork/* path to the backend root path (query kept).
+function ipolloUpstreamPath(rawUrl) {
+  let p = rawUrl || '/';
+  let q = '';
+  const qi = p.indexOf('?');
+  if (qi >= 0) { q = p.slice(qi); p = p.slice(0, qi); }
+  if (p === IPOLLOWORK_BASE) p = IPOLLOWORK_BASE + '/';
+  if (p.startsWith(IPOLLOWORK_BASE + '/')) p = p.slice(IPOLLOWORK_BASE.length);
+  if (p === '') p = '/';
+  return p + q;
+}
+function ipolloHeaders(req) {
+  const backend = ipolloBackend();
+  const headers = cleanHeaders(req.headers);
+  delete headers['cookie'];
+  delete headers['host'];
+  delete headers['origin'];
+  delete headers['referer'];
+  headers['host'] = backend.host + ':' + backend.port;
+  if (IPOLLOWORK_CLIENT_TOKEN) headers['authorization'] = 'Bearer ' + IPOLLOWORK_CLIENT_TOKEN;
+  if (IPOLLOWORK_HOST_TOKEN) headers['x-ipollowork-host-token'] = IPOLLOWORK_HOST_TOKEN;
+  return { backend: backend, headers: headers };
+}
+function proxyIpollo(req, res, upstreamPath) {
+  const prep = ipolloHeaders(req);
+  const backend = prep.backend;
+  const headers = prep.headers;
+  const targetPath = upstreamPath !== undefined ? upstreamPath : ipolloUpstreamPath(req.url);
+  const upstreamReq = http.request({
+    host: backend.host,
+    port: backend.port,
+    method: req.method,
+    path: targetPath,
+    headers: headers,
+  }, (upstreamRes) => {
+    const rh = cleanHeaders(upstreamRes.headers);
+    res.writeHead(upstreamRes.statusCode || 502, rh);
+    upstreamRes.pipe(res);
+  });
+  upstreamReq.on('error', (e) => {
+    console.error('ipollowork proxy error:', e.message);
+    if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Gateway: iPolloWork 服务不可用');
+  });
+  req.on('error', () => upstreamReq.destroy());
+  res.on('error', () => upstreamReq.destroy());
+  res.on('close', () => { try { upstreamReq.destroy(); } catch (e) {} });
+  req.pipe(upstreamReq);
+}
+function proxyIpolloUpgrade(req, socket, head) {
+  const prep = ipolloHeaders(req);
+  const backend = prep.backend;
+  const headers = prep.headers;
+  const upstreamPath = ipolloUpstreamPath(req.url);
+  const lines = [req.method + ' ' + upstreamPath + ' HTTP/1.1'];
+  for (const k in headers) {
+    const v = headers[k];
+    if (Array.isArray(v)) lines.push(k + ': ' + v.join(', '));
+    else lines.push(k + ': ' + v);
+  }
+  lines.push('Connection: Upgrade');
+  lines.push('Upgrade: websocket');
+  lines.push('', '');
+  const raw = lines.join('\r\n');
+  const upstream = net.connect(backend.port, backend.host, () => {
+    upstream.write(raw);
+    if (head && head.length) upstream.write(head);
+    socket.pipe(upstream);
+    upstream.pipe(socket);
+  });
+  upstream.on('error', () => socket.destroy());
+  socket.on('error', () => upstream.destroy());
+  socket.on('close', () => upstream.destroy());
+  upstream.on('close', () => socket.destroy());
+}
+
 // ---------- request logging ----------
 function logLine(req, status, extra) {
   console.log(new Date().toISOString() + ' ' + clientIp(req) + ' ' + req.method + ' ' + req.url + ' ' + status + (extra ? ' ' + extra : ''));
@@ -1191,7 +1287,10 @@ const server = http.createServer(async (req, res) => {
     return res.end(htmlShell('交付文件', body));
   }
 
-  // everything else
+  // ---------- iPolloWork (public front, replacing the DSH web app) ----------
+  // After login everything proxies to the iPolloWork server; the landing page
+  // maps to its web UI (/ui). The per-user DSH instances stay on loopback and
+  // are reached by iPolloWork's deepseek-harness plugin, not via this gateway.
   if (!session) {
     if (req.method === 'GET' && !pathname.startsWith('/api/')) {
       const csrf = crypto.randomBytes(16).toString('hex');
@@ -1202,22 +1301,15 @@ const server = http.createServer(async (req, res) => {
     }
     return json(res, 401, { ok: false, error: '未登录' });
   }
-  if (!hasKey(session.u)) {
-    if (req.method === 'GET' && !pathname.startsWith('/api/')) return redirect(res, '/setup');
-    return json(res, 403, { ok: false, error: '请先配置 API Key', redirect: '/setup' });
-  }
-  const u = getUser(session.u);
-  if (!u || !u.port) {
-    clearSession(res);
-    return json(res, 401, { ok: false, error: '账号不可用' });
-  }
-  proxyRequest(req, res, u.port, session.u);
+  if (!IPOLLOWORK_ENABLED) return json(res, 503, { ok: false, error: 'iPolloWork 未启用' });
+  if (pathname === '/') return proxyIpollo(req, res, '/ui');
+  return proxyIpollo(req, res);
 });
 
 server.on('upgrade', (req, socket, head) => {
   const session = getSession(req);
   if (!session) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
-  if (!hasKey(session.u)) { socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return; }
+  if (IPOLLOWORK_ENABLED) return proxyIpolloUpgrade(req, socket, head);
   const u = getUser(session.u);
   if (!u || !u.port) { socket.destroy(); return; }
   proxyUpgrade(req, socket, head, u.port);
