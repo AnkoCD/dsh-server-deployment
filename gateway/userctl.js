@@ -53,6 +53,29 @@ function allocPort(db) {
 }
 function homeOf(name) { return path.join(USERS_DIR, name); }
 
+// Enable full-text session search for this user. DSH ships the
+// session-query-sqlite index with openAt: never (content search is opt-in),
+// which makes the web client degrade to name-only matching. The home-level
+// patch layer applies over every profile, so this one file enables content
+// search for web and headless profiles alike; the in-memory SQLite index
+// opens on first search.
+const SEARCH_PATCH = [
+  '# $DSH_HOME patch layer - applied over every profile own layer.',
+  '# Enables full-text session search (opt-in in DSH): the session-query-sqlite',
+  '# index defaults to openAt: never; open the in-memory SQLite index on first',
+  '# search instead.',
+  '- id: session-query-sqlite',
+  '  config:',
+  "    path: ':memory:'",
+  '    openAt: first-search',
+  '',
+].join('\n');
+function writeSearchPatch(name) {
+  const file = path.join(homeOf(name), 'cordis.patch.yml');
+  if (fs.existsSync(file)) return;
+  fs.writeFileSync(file, SEARCH_PATCH, { mode: 0o644 });
+}
+
 function createHome(name) {
   const home = homeOf(name);
   fs.mkdirSync(path.join(home, 'workspace'), { recursive: true, mode: 0o700 });
@@ -64,6 +87,7 @@ function createHome(name) {
       fs.writeFileSync(settings, def);
     }
   }
+  writeSearchPatch(name);
   const osu = osUserOf(name);
   execFileSync('chown', ['-R', osu + ':' + osu, home]);
   try { fs.chmodSync(home, 0o700); } catch (e) {}
