@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const url = require('url');
 const { execFileSync, spawn } = require('child_process');
+const zlib = require('zlib');
 const { verifyPassword, timingSafeStr } = require('./auth.js');
 
 const HOST = process.env.HOST || '127.0.0.1';
@@ -28,6 +29,22 @@ const FILE_STAT_HELPER = process.env.FILE_STAT_HELPER || '/opt/deepseek-harness/
 const FILE_READ_HELPER = process.env.FILE_READ_HELPER || '/opt/deepseek-harness/bin/dsh-file-read';
 const FILE_LIST_HELPER = process.env.FILE_LIST_HELPER || '/opt/deepseek-harness/bin/dsh-file-list';
 const UPLOAD_MAX_MB = parseInt(process.env.UPLOAD_MAX_MB || '100', 10);
+
+// ---------- history page trimming + JSON gzip tuning ----------
+// Huge agent sessions accumulate tens of thousands of streaming chunk events
+// per page: the DSH host pages by *messages* (user/message, assistant/message)
+// while keeping every tool/chunk event of the page, and it never compresses.
+// The web client asks for the last 50 messages, parses/renders every returned
+// event and aborts its own fetch after 30s ("The user aborted a request."),
+// so a multi-MB page over a slow link fails. The gateway therefore trims
+// oversized history pages to the last few messages at message boundaries (the
+// same boundary rule the host applies) and gzips JSON responses the host
+// leaves raw. Trimming never drops data: the page tail is kept, hasMore is
+// forced true, and the client's beforeSeq paging walks the skipped range.
+const HISTORY_TRIM_MESSAGES = parseInt(process.env.HISTORY_TRIM_MESSAGES || '6', 10);
+const HISTORY_TRIM_MIN_EVENTS = parseInt(process.env.HISTORY_TRIM_MIN_EVENTS || '2000', 10);
+const GZIP_MIN_BYTES = parseInt(process.env.GZIP_MIN_BYTES || '256', 10);
+const HISTORY_BUF_MAX = 64 * 1024 * 1024;
 
 function loadSecret() {
   try {
@@ -585,12 +602,56 @@ function currentCwd(user) {
   return (e && e.cwd) || null;
 }
 
+const HISTORY_MESSAGE_TYPES = new Set(['user/message', 'assistant/message']);
+// Returns { events, hasMore } when the page was trimmed, otherwise null.
+function trimHistoryValue(value) {
+  if (!value || !Array.isArray(value.events) || value.events.length <= HISTORY_TRIM_MIN_EVENTS) return null;
+  const events = value.events;
+  for (const item of events) {
+    if (!item || !item.event || typeof item.event.seq !== 'number') return null;
+  }
+  const kept = [];
+  let count = 0;
+  let trimmed = false;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i].event;
+    if (HISTORY_MESSAGE_TYPES.has(ev.type) && ev.surfaceOp === 'append') count++;
+    if (count >= HISTORY_TRIM_MESSAGES) {
+      const sources = (Array.isArray(ev.sourceEventSeqs) ? ev.sourceEventSeqs : []).filter((s) => typeof s === 'number');
+      const groupStart = Math.min(ev.seq, ...sources);
+      for (let j = i; j >= 0 && events[j].event.seq >= groupStart; j--) kept.push(events[j]);
+      trimmed = true;
+      break;
+    }
+    kept.push(events[i]);
+  }
+  if (!trimmed) return null;
+  kept.reverse();
+  return { events: kept, hasMore: true };
+}
+function gzipBodyIfWanted(req, upstreamHeaders, body) {
+  const ae = String(req.headers['accept-encoding'] || '');
+  if (/\bgzip\b/.test(ae) && !upstreamHeaders['content-encoding'] && body.length >= GZIP_MIN_BYTES) {
+    try { return zlib.gzipSync(body, { level: 4 }); } catch (e) {}
+  }
+  return null;
+}
+function setGzipHeaders(h) {
+  const out = Object.assign({}, h);
+  delete out['content-length'];
+  out['content-encoding'] = 'gzip';
+  const v = String(out['vary'] || '');
+  out['vary'] = v.indexOf('Accept-Encoding') >= 0 ? v : (v ? v + ', ' : '') + 'Accept-Encoding';
+  return out;
+}
+
 function proxyRequest(req, res, port, user) {
   const headers = backendHeaders(req, port);
   const qIdx = req.url.indexOf('?');
   const reqPath = qIdx < 0 ? req.url : req.url.slice(0, qIdx);
   // DSH client RPC paths are singular: /api/session.list, /api/session.history.
   const sniffHistoryReq = req.method === 'POST' && reqPath === '/api/session.history' && !!user;
+  const sniffHistoryRes = sniffHistoryReq;
   const sniffListRes = req.method === 'POST' && reqPath === '/api/session.list' && !!user;
   const upstreamReq = http.request({
     host: '127.0.0.1',
@@ -602,14 +663,25 @@ function proxyRequest(req, res, port, user) {
     const rh = cleanHeaders(upstreamRes.headers);
     const ct = String(upstreamRes.headers['content-type'] || '');
     const canInject = req.method === 'GET' && ct.indexOf('text/html') === 0 && !upstreamRes.headers['content-encoding'];
-    if (!canInject && !sniffListRes) {
+    const wantJsonGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || '')) && !upstreamRes.headers['content-encoding'] && ct.indexOf('application/json') === 0;
+    const needBuffer = canInject || sniffListRes || sniffHistoryRes;
+    if (!needBuffer) {
       upstreamRes.on('error', () => { try { res.destroy(); } catch (e) {} });
-      res.writeHead(upstreamRes.statusCode || 502, rh);
-      upstreamRes.pipe(res);
+      if (wantJsonGzip) {
+        const gz = zlib.createGzip({ level: 4 });
+        gz.on('error', () => { try { res.destroy(); } catch (e) {} });
+        res.writeHead(upstreamRes.statusCode || 502, setGzipHeaders(rh));
+        upstreamRes.pipe(gz).pipe(res);
+      } else {
+        res.writeHead(upstreamRes.statusCode || 502, rh);
+        upstreamRes.pipe(res);
+      }
       return;
     }
-    // Buffer small bodies: SPA HTML for injection, session lists for cwd tracking.
-    const MAX_BUF = 8 * 1024 * 1024;
+    // Buffer small bodies: SPA HTML for injection, session lists for cwd
+    // tracking, session history for page trimming. Oversized bodies fall
+    // back to a plain untouched stream.
+    const MAX_BUF = sniffHistoryRes ? HISTORY_BUF_MAX : 8 * 1024 * 1024;
     let buf = [];
     let size = 0;
     let settled = false;
@@ -629,21 +701,37 @@ function proxyRequest(req, res, port, user) {
     upstreamRes.on('end', () => {
       if (settled) return;
       settled = true;
-      const body = Buffer.concat(buf);
+      let body = Buffer.concat(buf);
+      let outHeaders = rh;
       if (sniffListRes) {
         try {
           const j = JSON.parse(body.toString('utf8'));
           feedSessionList(user, j && j.result && j.result.value && j.result.value.items);
         } catch (e) {}
-        res.writeHead(upstreamRes.statusCode || 502, rh);
-        res.end(body);
-        return;
+      } else if (sniffHistoryRes) {
+        try {
+          const j = JSON.parse(body.toString('utf8'));
+          const v = j && j.result && j.result.value;
+          const t = trimHistoryValue(v);
+          if (t) {
+            v.events = t.events;
+            v.hasMore = t.hasMore;
+            body = Buffer.from(JSON.stringify(j), 'utf8');
+            console.log('history-trim ' + user + ' kept ' + t.events.length + ' events');
+          }
+        } catch (e) {}
+      } else {
+        let html = body.toString('utf8');
+        const at = html.toLowerCase().lastIndexOf('</body>');
+        html = at >= 0 ? html.slice(0, at) + FILES_LINK_HTML + html.slice(at) : html + FILES_LINK_HTML;
+        body = Buffer.from(html, 'utf8');
       }
-      let html = body.toString('utf8');
-      const at = html.toLowerCase().lastIndexOf('</body>');
-      html = at >= 0 ? html.slice(0, at) + FILES_LINK_HTML + html.slice(at) : html + FILES_LINK_HTML;
-      res.writeHead(upstreamRes.statusCode || 502, rh);
-      res.end(Buffer.from(html, 'utf8'));
+      if (wantJsonGzip) {
+        const gz = gzipBodyIfWanted(req, upstreamRes.headers, body);
+        if (gz) { body = gz; outHeaders = setGzipHeaders(outHeaders); }
+      }
+      res.writeHead(upstreamRes.statusCode || 502, outHeaders);
+      res.end(body);
     });
     upstreamRes.on('error', () => {
       if (!settled) { settled = true; if (!res.headersSent) { try { res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }); } catch (e) {} } }
