@@ -4,7 +4,7 @@
   <img src="assets/cover.png" alt="DSH 服务器部署封面" width="100%">
 </p>
 
-为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）Web 端增加**多用户门户**的零依赖 Node 网关：登录认证、每用户独立 DSH 实例与 OS 级数据隔离、每用户独立 API Key，以及内置的**交付文件抽屉**（下载 / 上传 / 当前工作区自动定位）。
+为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）Web 端增加**多用户门户**的零依赖 Node 网关：登录认证、每用户独立 DSH 实例与 OS 级数据隔离、每用户独立 API Key，以及内置的**交付文件抽屉**（下载 / 上传 / 当前工作区自动定位）。隔离以 **OS 账号为边界**而非网关代码——文件访问经 sudo 助手 `runuser` 降权为 `dsh-<name>` 用户执行（修复 issue #1 TOCTOU 竞态），网关对用户目录零权限；完整机制见 [docs/multi-user-isolation.md](docs/multi-user-isolation.md)。
 
 > **部署定位（重要）**：本项目是**服务器端部署**方案——网关、每用户 DSH 实例与文件助手全部运行在**远程服务器**上，多个用户通过浏览器（公网域名 + HTTPS）访问各自的会话与交付文件；它**不是本机 / 桌面工具**，**无需在用户电脑上安装任何软件**。文档中的示例路径（如 `/opt/deepseek-harness`、`/etc/systemd/system`）均为服务器端路径。
 
@@ -16,6 +16,7 @@
 - **回环特权接口修复**：网关向后端呈现 `Host: 127.0.0.1:<port>` 并剥离浏览器信任标记，DSH 钉在回环的 settings / credentials / agentPreset 等特权接口在公网访问下同样可用。
 - **交付文件抽屉**：主界面右下角两颗可拖动胶囊「交付文件」「上传文件」，白色抽屉内嵌文件浏览器——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。
 - **安全边界**：所有用户文件访问经 sudoers 固定路径的助手脚本——root 仅校验参数并降权，文件操作以 `dsh-<name>` 用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；网关进程对用户目录零权限；隐藏文件（含 `.credentials.yaml`）不可下载；SPA 注入尊重 `prefers-reduced-motion`、无玻璃拟态/渐变装饰。
+- **部署友好**：助手脚本与 `bin/dsh-users.sh` 按自身位置自定位（issue #3），任意前缀检出即可直接运行；网关与 userctl 支持环境变量覆盖全部安装路径（见下方变量表）；systemd 单元支持 `EnvironmentFile=-/etc/default/dsh-gateway` 注入配置；运行状态与密钥（`.local-run/` 等）全部 gitignore，不入库。
 
 ## 架构
 
@@ -85,7 +86,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 | `HOST`、`PORT`、`SESSION_TTL`、`COOKIE_SECURE`、`DEEPSEEK_BASE_URL`、`UPLOAD_MAX_MB`、`MAX_IP_ATTEMPTS`、`MAX_USER_ATTEMPTS`、`WINDOW_MS`、`LOCK_MS` | 网关 | 见 `gateway/server.js` |
 | `DSH_TRUSTED_HOST` | userctl（实例 `--trusted-host`） | `127.0.0.1:1145` |
 
-`bin/dsh-users.sh` 与 `bin/dsh-file-list` 已按自身位置自定位：任意目录检出即可直接运行（`dsh-users.sh` 首次调用自动重提权为 root；node 解析相对脚本位置，缺失时回退 `PATH`）。自定义安装前缀时 systemd 单元用上面的 `sed` 命令生成。
+`bin/dsh-users.sh` 与 `bin/dsh-file-list` 已按自身位置自定位：任意目录检出即可直接运行（`dsh-users.sh` 首次调用自动重提权为 root；node 解析相对脚本位置，缺失时回退 `PATH`）。自定义安装前缀时 systemd 单元用上面的 `sed` 命令生成；网关 systemd 单元还支持 `EnvironmentFile=-/etc/default/dsh-gateway`，可在该文件里统一注入上述环境变量。
 
 ## 交付文件抽屉的行为细节
 
