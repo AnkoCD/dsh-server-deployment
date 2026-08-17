@@ -1,4 +1,25 @@
 #!/usr/bin/env bash
 # dsh-file-list <home> [dir] -- JSON directory listing inside <home>.
 # exit: 2 usage, 3 out of scope, 4 missing/not a directory.
-exec /opt/deepseek-harness/runtime/bin/node /opt/deepseek-harness/bin/dsh-file-list.js "$@"
+#
+# Security model (fixes issue #1 TOCTOU): the listing itself runs as the
+# home's own OS account; root only validates arguments. Node binary and
+# script resolve relative to this wrapper's install dir (issue #3), so the
+# whole tree is relocatable - falls back to PATH node if the bundled
+# runtime is absent.
+set -euo pipefail
+home="$1"
+dir="${2:-}"
+here="$(cd "$(dirname "$0")" && pwd)"
+node_bin="$here/../runtime/bin/node"
+[ -x "$node_bin" ] || node_bin="$(command -v node || true)"
+[ -n "$node_bin" ] || exit 4
+osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+case "$osu" in
+  dsh-?*) ;;
+  *) exit 3 ;;
+esac
+case "$osu" in
+  *[!a-z0-9_-]*) exit 3 ;;
+esac
+exec runuser -u "$osu" -- "$node_bin" "$here/dsh-file-list.js" "$home" "$dir"

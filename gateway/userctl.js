@@ -5,12 +5,12 @@ const { execFileSync } = require('child_process');
 const { hashPassword } = require('./auth.js');
 const { hasApiKey, setApiKey } = require('./credentials.js');
 
-const BASE_DIR = '/opt/deepseek-harness';
+const BASE_DIR = process.env.DSH_BASE_DIR || '/opt/deepseek-harness';
 const USERS_DIR = process.env.DSH_USERS_DIR || path.join(BASE_DIR, 'users');
 const USERS_FILE = process.env.DSH_USERS_FILE || path.join(BASE_DIR, 'gateway', 'users.json');
-const SETTINGS_SRC = path.join(BASE_DIR, 'settings.yaml');
-const NODE_BIN = path.join(BASE_DIR, 'runtime', 'bin', 'node');
-const DSH_BIN = path.join(BASE_DIR, 'app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+const SETTINGS_SRC = process.env.DSH_SETTINGS_SRC || path.join(BASE_DIR, 'settings.yaml');
+const NODE_BIN = process.env.DSH_NODE_BIN || path.join(BASE_DIR, 'runtime', 'bin', 'node');
+const DSH_BIN = process.env.DSH_DSH_BIN || path.join(BASE_DIR, 'app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 const TRUSTED_HOST = process.env.DSH_TRUSTED_HOST || '127.0.0.1:1145';
 const BASE_URL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
 const MIN_PORT = 3101;

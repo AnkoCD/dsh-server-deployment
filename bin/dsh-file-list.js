@@ -1,6 +1,8 @@
 'use strict';
 // dsh-file-list.js <home> [dir] -- print JSON {home, dir, truncated, entries:[{name,dir,size,mtime}]}.
-// Runs as root via the dsh-file-list wrapper; validates the target stays inside home.
+// Runs as the home's own OS user via the dsh-file-list wrapper (issue #1);
+// its realpath/prefix validation keeps exit codes stable but the OS account
+// is the real boundary.
 const fs = require('fs');
 const path = require('path');
 const home = process.argv[2] || '';

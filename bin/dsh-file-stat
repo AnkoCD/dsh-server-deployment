@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 # dsh-file-stat <home> <path> -- print byte size of a regular file inside <home>.
 # exit: 2 usage, 3 out of scope, 4 missing/not a file, 5 hidden dotfile.
+#
+# Security model (fixes issue #1 TOCTOU): see dsh-file-read; root never
+# stats a user-controlled path - the target OS user does.
 set -euo pipefail
 home="$1"
 path="$2"
 [ -n "$home" ] && [ -n "$path" ] || exit 2
 name="$(basename "$path")"
 case "$name" in .*) exit 5 ;; esac
+osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+case "$osu" in
+  dsh-?*) ;;
+  *) exit 3 ;;
+esac
+case "$osu" in
+  *[!a-z0-9_-]*) exit 3 ;;
+esac
 hd="$(realpath "$home")" || exit 3
 pd="$(realpath "$path")" || exit 4
 case "$pd" in "$hd"|"$hd"/*) ;; *) exit 3 ;; esac
 [ -f "$pd" ] || exit 4
-stat -c '%s' "$pd"
+exec runuser -u "$osu" -- stat -c '%s' "$pd"

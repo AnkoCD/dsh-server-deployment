@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# dsh-file-put <home> <dir> <name> -- write stdin into <dir>/<name>, owned like <dir>.
+# dsh-file-put <home> <dir> <name> -- write stdin into <dir>/<name>.
 # Invoked via sudo (see /etc/sudoers.d/dsh-upload) by the gateway for web uploads.
+#
+# Security model (fixes issue #1 TOCTOU): root performs ONLY string
+# validation of arguments and derives the target OS user; every filesystem
+# operation (mktemp/cat/stat/chmod/mv) runs as that unprivileged user via
+# runuser. A symlink swap race can therefore only redirect the write into
+# locations the user can already write - no privilege boundary left to cross.
+# The realpath prefix checks below are best-effort UX (stable exit codes),
+# not the security boundary.
 set -euo pipefail
 home="$1"
 dir="$2"
@@ -11,16 +19,30 @@ case "$name" in
 esac
 case "$name" in .*) exit 2 ;; esac
 [ "${#name}" -le 200 ] || exit 2
+# Derive the per-user OS account exactly like userctl.js osUserOf():
+# 'dsh-' + lowercase(basename(home)); refuse anything else so a compromised
+# gateway can never make us exec as root/other system accounts.
+osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+case "$osu" in
+  dsh-?*) ;;
+  *) exit 3 ;;
+esac
+case "$osu" in
+  *[!a-z0-9_-]*) exit 3 ;;
+esac
 hd="$(realpath "$home")" || exit 3
 [ -d "$dir" ] || exit 4
 pd="$(realpath "$dir")" || exit 3
 case "$pd" in "$hd"|"$hd"/*) ;; *) exit 3 ;; esac
-tmp="$(mktemp "$pd/.dsh-up.XXXXXX")" || exit 4
-trap 'rm -f "$tmp"' EXIT
-cat > "$tmp"
-if [ "$(stat -c%s "$tmp")" -gt "$MAX_BYTES" ]; then exit 5; fi
-chown --reference="$pd" "$tmp"
-chmod 0644 "$tmp"
-mv -f "$tmp" "$pd/$name"
-trap - EXIT
-exit 0
+exec runuser -u "$osu" -- bash -c '
+  set -euo pipefail
+  dir="$1"; name="$2"; max="$3"
+  tmp="$(mktemp "$dir/.dsh-up.XXXXXX")" || exit 4
+  trap '\''rm -f "$tmp"'\'' EXIT
+  cat > "$tmp"
+  [ "$(stat -c%s "$tmp")" -gt "$max" ] && exit 5
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$dir/$name"
+  trap - EXIT
+  exit 0
+' _ "$pd" "$name" "$MAX_BYTES"

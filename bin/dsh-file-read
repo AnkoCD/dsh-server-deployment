@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # dsh-file-read <home> <path> -- stream a file inside <home> to stdout.
 # exit: 2 usage, 3 out of scope, 4 missing/not a file, 5 hidden dotfile.
+#
+# Security model (fixes issue #1 TOCTOU): root only string-validates args;
+# the actual cat runs as the home's own unprivileged OS account. The
+# realpath prefix check keeps exit-code semantics but is no longer the
+# security boundary.
 set -euo pipefail
 home="$1"
 path="$2"
 [ -n "$home" ] && [ -n "$path" ] || exit 2
 name="$(basename "$path")"
 case "$name" in .*) exit 5 ;; esac
+osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+case "$osu" in
+  dsh-?*) ;;
+  *) exit 3 ;;
+esac
+case "$osu" in
+  *[!a-z0-9_-]*) exit 3 ;;
+esac
 hd="$(realpath "$home")" || exit 3
 pd="$(realpath "$path")" || exit 4
 case "$pd" in "$hd"|"$hd"/*) ;; *) exit 3 ;; esac
 [ -f "$pd" ] || exit 4
-exec cat "$pd"
+exec runuser -u "$osu" -- cat "$pd"

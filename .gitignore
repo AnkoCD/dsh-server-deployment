@@ -7,3 +7,4 @@ state-cwd.json
 .credentials.yaml
 .htpasswd*
 *.bak
+.local-run/

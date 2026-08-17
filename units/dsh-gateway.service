@@ -1,9 +1,12 @@
+# 路径模板：默认前缀 /opt/deepseek-harness。自定义安装时执行
+#   sed "s|/opt/deepseek-harness|<你的前缀>|g" units/dsh-gateway.service | sudo tee /etc/systemd/system/dsh-gateway.service
 [Unit]
 Description=DeepSeek Harness Auth Gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+EnvironmentFile=-/etc/default/dsh-gateway
 Type=simple
 User=ubuntu
 Group=ubuntu
