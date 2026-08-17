@@ -22,7 +22,7 @@ case "$name" in .*) exit 2 ;; esac
 # Derive the per-user OS account exactly like userctl.js osUserOf():
 # 'dsh-' + lowercase(basename(home)); refuse anything else so a compromised
 # gateway can never make us exec as root/other system accounts.
-osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+osu="dsh-$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
 case "$osu" in
   dsh-?*) ;;
   *) exit 3 ;;

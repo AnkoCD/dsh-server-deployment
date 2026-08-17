@@ -78,6 +78,10 @@ function writeSearchPatch(name) {
 
 function createHome(name) {
   const home = homeOf(name);
+  // The users root must stay traversable (0711) so every dsh-<name> account
+  // can reach its own 0700 home; recursive mkdirSync would create it 0700
+  // root and break per-user instance startup (CHDIR permission denied).
+  try { fs.mkdirSync(USERS_DIR, { recursive: true }); fs.chmodSync(USERS_DIR, 0o711); } catch (e) {}
   fs.mkdirSync(path.join(home, 'workspace'), { recursive: true, mode: 0o700 });
   const settings = path.join(home, 'settings.yaml');
   if (!fs.existsSync(settings)) {

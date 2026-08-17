@@ -7,4 +7,14 @@ state-cwd.json
 .credentials.yaml
 .htpasswd*
 *.bak
+
+# local dev/testing tree
 .local-run/
+
+# ops/deploy records - server-private, never commit
+docs/dsh-*-deployment.md
+docs/dsh-portal-handover.md
+docs/dsh-server-deployment-issues.md
+docs/dsh-web-deploy-patches.md
+units/dsh-web-*.service
+

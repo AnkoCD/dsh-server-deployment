@@ -14,7 +14,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 node_bin="$here/../runtime/bin/node"
 [ -x "$node_bin" ] || node_bin="$(command -v node || true)"
 [ -n "$node_bin" ] || exit 4
-osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+osu="dsh-$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
 case "$osu" in
   dsh-?*) ;;
   *) exit 3 ;;

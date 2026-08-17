@@ -14,20 +14,22 @@
 - **用户隔离**：每个用户一个独立 DSH 实例（独立端口），以独立系统账号 `dsh-<name>` 运行，`DSH_HOME` 指向其 0700 私有目录；`userctl.js` 一条命令完成建号 / 改密 / 删号 / 预置 Key。
 - **每用户独立 API Key**：登录后无 Key 自动引导 `/setup` 填写，经回环 RPC 写入该用户私有的 `.credentials.yaml`（0600，属主仅本人）。
 - **回环特权接口修复**：网关向后端呈现 `Host: 127.0.0.1:<port>` 并剥离浏览器信任标记，DSH 钉在回环的 settings / credentials / agentPreset 等特权接口在公网访问下同样可用。
-- **交付文件抽屉**：主界面右下角两颗可拖动胶囊「交付文件」「上传文件」，白色抽屉内嵌文件浏览器——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。
+- **交付文件抽屉（文件管理）**：主界面右下角**一颗**可拖动胶囊「🗂 文件管理」（2026-08 起由「交付文件」+「上传文件」双胶囊合并而来），白色抽屉内嵌文件浏览器——目录浏览、下载（attachment + 中文文件名）、多文件上传（100MB 上限）；自动定位到当前对话所在工作目录（嗅探会话 RPC 追踪 cwd，持久化恢复）。胶囊在 SPA 弹窗（设置面板/模态）打开时自动隐藏，避免遮挡。
 - **安全边界**：所有用户文件访问经 sudoers 固定路径的助手脚本——root 仅校验参数并降权，文件操作以 `dsh-<name>` 用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；网关进程对用户目录零权限；隐藏文件（含 `.credentials.yaml`）不可下载；SPA 注入尊重 `prefers-reduced-motion`、无玻璃拟态/渐变装饰。
-- **部署友好**：助手脚本与 `bin/dsh-users.sh` 按自身位置自定位（issue #3），任意前缀检出即可直接运行；网关与 userctl 支持环境变量覆盖全部安装路径（见下方变量表）；systemd 单元支持 `EnvironmentFile=-/etc/default/dsh-gateway` 注入配置；运行状态与密钥（`.local-run/` 等）全部 gitignore，不入库。
 
 ## 架构
 
 ```
-浏览器 ──https──▶ 反向代理(TLS, 例: OpenResty) ──▶ dsh-gateway(:3081) ──▶ 每用户 DSH 实例(:3101+)
+浏览器 ──https──▶ 反向代理(TLS, 例: OpenResty) ──▶ dsh-gateway(:3100) ──▶ 每用户 DSH 实例(:3101+)
                                   │                     │
                                   │ 会话/限流/CSRF/路由  │ 以独立 OS 账号 dsh-<name> 运行
                                   │ Key 引导/抽屉注入    │ DSH_HOME=<用户私有目录 0700>
                                   └──────────┬──────────┘
                                              └─ 文件访问走 sudo 助手: dsh-file-{list,stat,read,put}
 ```
+
+> 网关默认端口在运行部署中为 **3100**（本仓库示例为 3081，可用环境变量 `PORT` 覆盖）；每用户实例
+> 自 3101 递增，由 `userctl` 分配。
 
 多用户与数据隔离的完整说明见 [docs/multi-user-isolation.md](docs/multi-user-isolation.md)。
 
@@ -90,7 +92,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 
 ## 交付文件抽屉的行为细节
 
-- **自动定位**：网关嗅探代理流量中的 `session.history`（打开会话）与 `session.list`（每会话含 cwd），记住当前对话目录并持久化到 `state-cwd.json`；打开「交付文件」即列出该目录（目录失效自动回退工作区）。
+- **自动定位**：网关嗅探代理流量中的 `session.history`（打开会话）与 `session.list`（每会话含 cwd），记住当前对话目录并持久化到 `state-cwd.json`；打开「文件管理」即列出该目录（目录失效自动回退工作区）。
 - **嵌入与关闭**：抽屉以同源 iframe 内嵌（`X-Frame-Options: SAMEORIGIN`）；页面内「返回应用」运行时检测 iframe 环境，发 `postMessage('dshgw-close')` 关闭抽屉而非导航，杜绝嵌套打开。
 - **上传**：原始字节体 `POST /__gw/upload?dir=&name=`，助手降权为 `dsh-<name>` 落盘（root 仅校验参数），文件属主天然为本人，同名覆盖，超限 413。
 

@@ -12,14 +12,14 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/deepseek-harness/gateway
 Environment=HOST=127.0.0.1
-Environment=PORT=3081
+Environment=PORT=3100
 Environment=USERS_FILE=/opt/deepseek-harness/gateway/users.json
 Environment=SECRET_FILE=/opt/deepseek-harness/gateway/secret
 Environment=USERS_DIR=/opt/deepseek-harness/users
 Environment=DEEPSEEK_BASE_URL=https://api.deepseek.com
 Environment=COOKIE_SECURE=1
 Environment=SESSION_TTL=43200
-ExecStart=/opt/deepseek-harness/runtime/bin/node /opt/deepseek-harness/gateway/server.js
+ExecStart=/usr/bin/node /opt/deepseek-harness/gateway/server.js
 Restart=on-failure
 RestartSec=3
 

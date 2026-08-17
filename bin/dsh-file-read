@@ -12,7 +12,7 @@ path="$2"
 [ -n "$home" ] && [ -n "$path" ] || exit 2
 name="$(basename "$path")"
 case "$name" in .*) exit 5 ;; esac
-osu="$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
+osu="dsh-$(printf '%s' "$(basename "$home")" | tr 'A-Z' 'a-z')"
 case "$osu" in
   dsh-?*) ;;
   *) exit 3 ;;

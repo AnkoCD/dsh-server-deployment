@@ -451,12 +451,16 @@ function userHome(user) {
   return (u && u.home) || path.join(USERS_DIR, user);
 }
 
-// In-page deliverables widgets injected into the SPA shell: two draggable
-// capsule buttons (交付文件 / 上传文件) each opening its own restrained white
-// drawer (light paper/ink tokens, per the impeccable design reference). No
-// page navigation; embedded pages close the drawer via postMessage. No
-// backdrop blur or gradient chrome; focus rings, ESC/backdrop close,
-// reduced-motion respected.
+// In-page file-management widget injected into the SPA shell: ONE draggable
+// capsule (文件管理) opening a single restrained white drawer (light
+// paper/ink tokens, per the impeccable design reference). The drawer embeds
+// /__gw/files?embed=1, which already carries breadcrumb browsing, download
+// links, and an upload-to-current-directory bar - the previously separate
+// 上传文件 capsule was redundant (issue #4 of the portal review) and is gone.
+// No page navigation; the embedded page closes the drawer via postMessage.
+// The capsule hides while the SPA shows any dialog (settings panel, modals)
+// so the floating button never covers app chrome. No backdrop blur or
+// gradient chrome; focus rings, ESC/backdrop close, reduced-motion respected.
 const FILES_LINK_HTML = [
   '<style>',
   '#dshgw-fab-stack{position:fixed;right:20px;bottom:20px;z-index:2147483000;display:flex;flex-direction:column;gap:10px;align-items:flex-end;touch-action:none;user-select:none}',
@@ -468,7 +472,6 @@ const FILES_LINK_HTML = [
   '.dshgw-ov{display:none;position:fixed;inset:0;z-index:2147483100;background:rgba(16,24,40,.45);align-items:center;justify-content:center;padding:24px}',
   '.dshgw-ov.open{display:flex}',
   '.dshgw-panel{position:relative;width:min(900px,100%);height:min(82vh,760px);background:#fcfcfd;border:1px solid #e2e8f0;border-radius:16px;box-shadow:0 1px 2px rgba(16,24,40,.06),0 8px 24px rgba(16,24,40,.12),0 32px 80px rgba(16,24,40,.18);overflow:hidden;display:flex;flex-direction:column;opacity:0;transform:translateY(10px) scale(.985);transition:opacity .18s ease,transform .18s ease}',
-  '.dshgw-panel.small{width:min(560px,100%);height:min(70vh,620px)}',
   '.dshgw-ov.open .dshgw-panel{opacity:1;transform:none}',
   '.dshgw-x{position:absolute;top:10px;right:10px;z-index:2;width:32px;height:32px;border-radius:10px;border:0;background:#f1f5f9;color:#475569;font:500 18px/1 -apple-system,"Segoe UI",sans-serif;cursor:pointer;display:flex;align-items:center;justify-content:center}',
   '.dshgw-x:hover{background:#e2e8f0;color:#0f172a}',
@@ -477,37 +480,31 @@ const FILES_LINK_HTML = [
   '@media (prefers-reduced-motion: reduce){.dshgw-fab,.dshgw-panel{transition:none}}',
   '</style>',
   '<div id="dshgw-fab-stack">',
-  '  <button class="dshgw-fab" id="dshgw-fab-files" type="button" aria-haspopup="dialog" title="浏览并下载当前工作区的交付文件">&#128229; 交付文件</button>',
-  '  <button class="dshgw-fab" id="dshgw-fab-up" type="button" aria-haspopup="dialog" title="上传文件到当前工作区">&#128228; 上传文件</button>',
+  '  <button class="dshgw-fab" id="dshgw-fab-files" type="button" aria-haspopup="dialog" title="浏览、下载与上传当前工作区的文件">&#128193; 文件管理</button>',
   '</div>',
-  '<div class="dshgw-ov" id="dshgw-ov-files" role="dialog" aria-modal="true" aria-label="交付文件">',
+  '<div class="dshgw-ov" id="dshgw-ov-files" role="dialog" aria-modal="true" aria-label="文件管理">',
   '  <div class="dshgw-panel">',
   '    <button class="dshgw-x" type="button" aria-label="关闭">&#215;</button>',
-  '    <iframe class="dshgw-frame" title="交付文件" src="about:blank"></iframe>',
-  '  </div>',
-  '</div>',
-  '<div class="dshgw-ov" id="dshgw-ov-up" role="dialog" aria-modal="true" aria-label="上传文件">',
-  '  <div class="dshgw-panel small">',
-  '    <button class="dshgw-x" type="button" aria-label="关闭">&#215;</button>',
-  '    <iframe class="dshgw-frame" title="上传文件" src="about:blank"></iframe>',
+  '    <iframe class="dshgw-frame" title="文件管理" src="about:blank"></iframe>',
   '  </div>',
   '</div>',
   '<script>',
   '(function(){',
   'var stack=document.getElementById("dshgw-fab-stack");',
-  'var fabs=[document.getElementById("dshgw-fab-files"),document.getElementById("dshgw-fab-up")];',
-  'var ovs=[document.getElementById("dshgw-ov-files"),document.getElementById("dshgw-ov-up")];',
-  'var frames=[ovs[0].querySelector("iframe"),ovs[1].querySelector("iframe")];',
-  'var loaded=[false,false],srcs=["/__gw/files?embed=1","/__gw/upload?embed=1"];',
+  'var fab=document.getElementById("dshgw-fab-files");',
+  'var ov=document.getElementById("dshgw-ov-files");',
+  'var frame=ov.querySelector("iframe");',
+  'var loaded=false;',
   'var moved=false;',
-  'function open(i){if(moved){moved=false;return;}if(!loaded[i]){frames[i].src=srcs[i];loaded[i]=true;}ovs[i].classList.add("open");ovs[i].querySelector(".dshgw-x").focus();}',
-  'function shutAll(){ovs.forEach(function(o){o.classList.remove("open");});}',
-  'fabs[0].addEventListener("click",function(){open(0);});',
-  'fabs[1].addEventListener("click",function(){open(1);});',
-  'ovs.forEach(function(o){var x=o.querySelector(".dshgw-x");x.addEventListener("click",shutAll);o.addEventListener("click",function(e){if(e.target===o)shutAll();});});',
+  'function open(){if(moved){moved=false;return;}if(!loaded){frame.src="/__gw/files?embed=1";loaded=true;}ov.classList.add("open");ov.querySelector(".dshgw-x").focus();}',
+  'function shutAll(){ov.classList.remove("open");}',
+  'fab.addEventListener("click",open);',
+  'var x=ov.querySelector(".dshgw-x");x.addEventListener("click",shutAll);ov.addEventListener("click",function(e){if(e.target===ov)shutAll();});',
   'document.addEventListener("keydown",function(e){if(e.key==="Escape")shutAll();});',
-  'window.addEventListener("message",function(e){if(e.data==="dshgw-close")shutAll();if(e.data==="dshgw-open-files")open(0);});',
-  'var dragging=false,sx=0,sy=0,ox=0,oy=0,posKey="dshgw-fab-pos-v1";',
+  'window.addEventListener("message",function(e){if(e.data==="dshgw-close")shutAll();if(e.data==="dshgw-open-files")open();});',
+  'var mo=new MutationObserver(function(){var dialogs=document.querySelectorAll("[role=dialog]");var visible=false;for(var i=0;i<dialogs.length;i++){var d=dialogs[i];if(d.getClientRects().length>0){visible=true;break;}}stack.style.display=visible?"none":"";});',
+  'mo.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:["class","style"]});',
+  'var dragging=false,sx=0,sy=0,ox=0,oy=0,posKey="dshgw-fab-pos-v2";',
   'try{var saved=JSON.parse(localStorage.getItem(posKey)||"null");if(saved&&typeof saved.x==="number"&&typeof saved.y==="number"){stack.style.right="auto";stack.style.bottom="auto";stack.style.left=saved.x+"px";stack.style.top=saved.y+"px";}}catch(e){}',
   'stack.addEventListener("pointerdown",function(ev){if(ev.button!==0)return;dragging=true;moved=false;sx=ev.clientX;sy=ev.clientY;var r=stack.getBoundingClientRect();ox=r.left;oy=r.top;stack.classList.add("dragging");});',
   'document.addEventListener("pointermove",function(ev){if(!dragging)return;var dx=ev.clientX-sx,dy=ev.clientY-sy;if(!moved&&Math.abs(dx)<6&&Math.abs(dy)<6)return;moved=true;var w=window.innerWidth,h=window.innerHeight,r=stack.getBoundingClientRect();var nx=Math.max(8,Math.min(ox+dx,w-r.width-8)),ny=Math.max(8,Math.min(oy+dy,h-r.height-8));stack.style.right="auto";stack.style.bottom="auto";stack.style.left=nx+"px";stack.style.top=ny+"px";});',
@@ -662,6 +659,12 @@ function proxyRequest(req, res, port, user) {
   }, (upstreamRes) => {
     const rh = cleanHeaders(upstreamRes.headers);
     const ct = String(upstreamRes.headers['content-type'] || '');
+    // DEPLOYMENT PATCH (dsh-server-deployment): HTML must never be cached by
+    // the browser — the SPA boot manifest (plugin revs) is regenerated on
+    // instance restart, and a cached index.html would pin the browser to old
+    // plugin bundles (stale UI after deployments). Force no-store on every
+    // text/html response, overriding whatever the upstream set.
+    if (ct.indexOf('text/html') === 0) rh['cache-control'] = 'no-store';
     const canInject = req.method === 'GET' && ct.indexOf('text/html') === 0 && !upstreamRes.headers['content-encoding'];
     const wantJsonGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || '')) && !upstreamRes.headers['content-encoding'] && ct.indexOf('application/json') === 0;
     const needBuffer = canInject || sniffListRes || sniffHistoryRes;
@@ -947,7 +950,7 @@ const server = http.createServer(async (req, res) => {
         '<div class="upbar"><input type="file" id="upfile" multiple><button type="button" id="upbtn">上传</button></div>',
         '<div class="upmsg" id="upmsg"></div>',
         '<div class="uplist" id="uplist"></div>',
-        '<div class="afters" id="afters" style="display:none"><a class="ghost" id="viewbtn" href="/__gw/files">查看交付文件</a></div>',
+        '<div class="afters" id="afters" style="display:none"><a class="ghost" id="viewbtn" href="/__gw/files">打开文件管理</a></div>',
         '<script>',
         'function backToApp(){if(window.parent!==window){try{parent.postMessage("dshgw-close","*");}catch(e){location.href="/";}}else{location.href="/";}}document.getElementById("backbtn").addEventListener("click",function(e){e.preventDefault();backToApp();});',
         (embed ? 'document.getElementById("viewbtn").addEventListener("click",function(e){e.preventDefault();parent.postMessage("dshgw-open-files","*");});' : ''),
@@ -1135,7 +1138,7 @@ const server = http.createServer(async (req, res) => {
     const embed = String(q.embed || '') === '1';
     const body = [
       '<div class="dlcard' + (embed ? ' embed' : '') + '">',
-      '<div class="dlhead"><div><h1>&#128193; 交付文件</h1><p class="sub">任务产出的文件保存在你的工作区里：点击「下载」保存到本地，也可以从本机上传文件到当前目录。</p></div>',
+      '<div class="dlhead"><div><h1>&#128193; 文件管理</h1><p class="sub">任务产出的文件保存在你的工作区里：点击「下载」保存到本地，也可以从本机上传文件到当前目录。</p></div>',
       '<a class="ghost" href="/" id="backbtn">返回应用</a>',
       '</div>',
       '<div class="crumbs">' + crumbs.join('') + '</div>',
@@ -1188,7 +1191,7 @@ const server = http.createServer(async (req, res) => {
     // The in-page drawer embeds this page in a same-origin iframe inside the SPA.
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-    return res.end(htmlShell('交付文件', body));
+    return res.end(htmlShell('文件管理', body));
   }
 
   // everything else
