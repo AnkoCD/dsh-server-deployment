@@ -98,10 +98,15 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 
 ## 安全注意事项
 
-- `bin/` 目录必须保持 root:root 权限，否则服务账号可替换助手脚本提权。
-- 文件助手（dsh-file-put/read/stat/list）自 2026-08 起 root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。
+- `bin/` 与 `gateway/` 目录必须保持 root:root 权限（0755，无组/其他写位），否则服务账号可替换助手脚本或网关代码提权；`users.json`/`secret` 属主为网关服务账号（0640/0600）。
+- 网关以专用系统账号 `dsh-gateway`（无 shell）运行，**切勿**用 `ubuntu` 等自带 NOPASSWD sudo 的云镜像账号运行网关；其 sudo 能力仅限 `/etc/sudoers.d/dsh-upload` 白名单中的四个文件助手。
+- **回环租户隔离**（`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`）：DSH 实例的特权接口按「Host 头是回环」放行，而所有实例同处 127.0.0.1--任何租户的 agent 都能伪造 Host 直连他人端口窃取 API Key。防护为 iptables OUTPUT 链：每个 `dsh-<name>` 只能连自己的实例端口与网关端口被 REJECT，root/网关账号不受影响。userctl 增删用户自动刷新规则；规则按**目标端口**逐条 REJECT（不可按 uid 全量拒绝，否则会掐断内核回包路径）。
+- 每用户实例带 systemd 资源限制（TasksMax/MemoryMax/CPUQuota，可经 `DSH_MEM_MAX`/`DSH_CPU_QUOTA` 调整）与内核加固项。
+- 文件助手（dsh-file-put/read/stat/list）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。
 - 用户凭据文件必须保持仅属主可读（0600）：DSH 启动时会强制检查（`assertOwnerOnly`）。本网关的 root 助手模型天然满足，不要给用户目录添加任何 ACL 读取授权（曾因此触发实例拒绝启动）。
-- 网关与所有实例仅监听 127.0.0.1，公网只暴露 TLS 反代。
+- 网关与所有实例仅监听 127.0.0.1，公网只暴露 TLS 反代；反代必须**覆盖**（非追加）`X-Forwarded-For` 为 `$remote_addr`（见 nginx 配置），否则攻击者可伪造 XFF 绕过网关 IP 限流。
+- 登录限流为 IP + 账号两级；账号锁定（5 次/15 分钟）本身可被滥用作 DoS，仅靠 IP 级限流与强密码缓解。改密会使 `pwdVer` 递增，所有已签发会话立即失效。
+- `/logout` 仅接受 POST（带 CSRF 双提交校验），防跨站登出。
 - 升级 DSH 后如需客户端行为修补（如 settings 持久化作用域），请自行评估，本仓库不修改 npm 包。
 - 使用时微软的密码自动填充会给左侧工作区目录带来问题，尽量关闭自动填充。
 

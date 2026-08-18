@@ -24,10 +24,12 @@
 | 层次 | 机制 | 说明 |
 |---|---|---|
 | 网络边界 | 仅监听 `127.0.0.1` | 网关与所有实例不暴露公网端口，公网只走 TLS 反代 |
+| 回环隔离 | iptables `DSH_LOOPBACK_GUARD` 链 | 每个租户 OS 账号只能连自己的实例端口；跨租户端口与网关端口被 REJECT（防伪造 Host 直连他人实例窃取 Key） |
 | 实例隔离 | 每用户独立 DSH 实例、独立端口 | `userctl.js add <name>` 自动分配端口并启动实例 |
 | 账号隔离 | 每用户独立 OS 账号 `dsh-<name>` | `DSH_HOME` 指向该用户的 0700 私有目录 |
+| 资源限制 | systemd TasksMax / MemoryMax / CPUQuota | 单个租户的失控 agent 不至于拖垮整机与其他租户 |
 | 凭据隔离 | `.credentials.yaml` 0600 属主仅本人 | API Key 经回环 RPC 写入用户私有目录，DSH 启动时强制检查 `assertOwnerOnly` |
-| 会话隔离 | HMAC 签名会话 Cookie + 每用户实例绑定 | Cookie 防篡改；登录后会话固定到该用户的实例 |
+| 会话隔离 | HMAC 签名会话 Cookie（内嵌 pwdVer）+ 每用户实例绑定 | Cookie 防篡改；改密后 pwdVer 递增，旧令牌全部失效 |
 | 文件访问 | sudo 助手 + `runuser` 降权 | root 仅校验参数，文件操作以 `dsh-<name>` 自身身份执行（见下） |
 
 ## 3. 文件访问助手的安全模型（issue #1 TOCTOU 修复）
@@ -51,13 +53,39 @@
 - sudoers 采用**固定路径白名单**（如 `/etc/sudoers.d/dsh-upload`），只放行 `dsh-file-put`、`dsh-file-stat`、`dsh-file-read`、`dsh-file-list` 四个助手，禁止 shell 通配。
 - 网关对用户目录**零权限**：会话、历史、Key、文件都只能经由助手与实例访问。
 
-## 4. 凭据与密钥
+## 4. 回环租户隔离（2026-08 新增）
 
-- 口令以 scrypt 哈希存储（兼容旧版 APR1），写入 `users.json`。
+DSH 实例把「Host 头是 127.0.0.1」当作特权请求的信任凭证（网关自己也是这么用的），但所有实例都监听在同一个 127.0.0.1 上，且每个租户的 agent 本就能执行任意 shell 命令——**文件系统隔离拦不住回环 HTTP**。没有回环防火墙时，租户 A 可以：
+
+```bash
+curl -H 'Host: 127.0.0.1:3102' http://127.0.0.1:3102/api/credentials.set ...
+```
+
+直接以「回环客户端」身份读写租户 B 实例的凭据、设置与会话。
+
+防护（`bin/dsh-loopback-guard`，经 `units/dsh-loopback-guard.service` 开机应用、userctl 增删用户时即时刷新）：
+
+```text
+iptables OUTPUT 链 DSH_LOOPBACK_GUARD：
+  ACCEPT  lo tcp uid=dsh-<name> dport=<自己端口>
+  REJECT  lo tcp uid=dsh-<name> dport=<其他租户端口>   （逐目标端口，非按 uid 全量）
+  REJECT  lo tcp uid=dsh-<name> dport=<网关端口>
+  RETURN
+```
+
+要点：
+- REJECT 必须按**目标端口**逐条下规则。按 uid 全量 REJECT 会把内核代表该用户实例发出的回包（sport=自己端口）一并掐断，表现为所有租户连接静默超时。
+- root、网关服务账号与普通用户不受影响。
+- 验证：`runuser -u dsh-<user> -- curl http://127.0.0.1:<其他租户端口>/` 应被拒（tcp-reset），连自己的实例端口正常。
+
+## 5. 凭据与密钥
+
+- 口令以 scrypt 哈希存储（兼容旧版 APR1），写入 `users.json`（原子写：临时文件 + rename）。
+- 改密时 `pwdVer` 递增，已签发的会话令牌（内嵌 pwdVer）立即全部失效。
 - API Key 仅存在于该用户私有目录的 `.credentials.yaml`（0600），网关不落库、不代理。
 - 所有运行状态与密钥文件（`secret`、`users.json`、`state-cwd.json`、`.credentials.yaml`、`.local-run/`）均在 `.gitignore` 中，**严禁提交**。
 
-## 5. 验证清单
+## 6. 验证清单
 
 在服务器上以 `<服务账号>` 执行（把 `<user>` 换成真实用户名）：
 
@@ -77,13 +105,20 @@ sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" /etc/passwd; echo "exit=$?
 
 # 降权生效：子进程应为 dsh-<user> 而非 root
 ps -ef | grep -E 'runuser.*dsh-'
+
+# 回环租户隔离（把端口换成另一租户的实例端口，应被拒绝）
+runuser -u dsh-<user> -- curl -s --connect-timeout 3 -o /dev/null -w "%{http_code}\n" http://127.0.0.1:<其他租户端口>/   # 期望 000
+runuser -u dsh-<user> -- curl -s --connect-timeout 3 -o /dev/null -w "%{http_code}\n" http://127.0.0.1:<自己端口>/       # 期望 200
 ```
 
 若 `ps` 输出中文件操作子进程的用户是 `root`，说明助手未正确降权，**禁止上线**。
 
-## 6. 运维注意
+## 7. 运维注意
 
-- 不要给用户目录添加任何 ACL 读取授权——DSH 的 `assertOwnerOnly` 检查会拒绝实例启动（曾因此触发）。
-- 自定义安装前缀时，必须同步修改 sudoers 白名单与网关的 `UPLOAD_HELPER` / `FILE_STAT_HELPER` / `FILE_READ_HELPER` / `FILE_LIST_HELPER` 四个环境变量。
-- 网关与实例仅监听 `127.0.0.1`；公网只暴露 TLS 反代（示例见 `nginx/dsh-https-1145.conf`）。
+- 网关必须以专用账号 `dsh-gateway`（无 shell、sudo 仅限四个文件助手）运行；切勿用带 NOPASSWD 全量 sudo 的云镜像账号。
+- `bin/`、`gateway/` 目录必须 root:root 0755；`users.json`（0640）/`secret`（0600）属主为 `dsh-gateway`。
+- 不要给用户目录添加任何 ACL 读取授权--DSH 的 `assertOwnerOnly` 检查会拒绝实例启动（曾因此触发）。
+- 自定义安装前缀时，必须同步修改 sudoers 白名单与网关的 `UPLOAD_HELPER` / `FILE_STAT_HELPER` / `FILE_READ_HELPER` / `FILE_LIST_HELPER` 四个环境变量；回环防护的网关端口经 `GW_PORT` 覆盖。
+- 回环防护规则由 `dsh-loopback-guard.service` 开机应用，userctl 增删用户即时刷新；服务器上存在 docker/1Panel 等 nftables 使用方，规则以 iptables-nft 混合模式共存，勿手动 flush `filter` 表。
+- 反向代理必须用 `proxy_set_header X-Forwarded-For $remote_addr;` **覆盖**客户端可能伪造的 XFF，否则网关 IP 限流可被绕过。
 - 升级 DSH 后如需客户端行为修补（如 settings 持久化作用域），请自行评估，本仓库不修改 npm 包。

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# dsh-loopback-guard-apply -- rebuild the tenant loopback firewall from
+# users.json. Thin wrapper so the systemd unit stays a plain ExecStart line
+# (systemd does not run $() command substitution).
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+USERS_FILE="${USERS_FILE:-/opt/deepseek-harness/gateway/users.json}"
+node_bin="$(command -v node)"
+[ -n "$node_bin" ] || node_bin="/usr/bin/node"
+specs="$("$node_bin" -e 'const u=JSON.parse(require("fs").readFileSync(process.env.USERS_FILE,"utf8")).users;process.stdout.write(Object.values(u).filter(x=>x&&x.osUser&&x.port).map(x=>x.osUser+":"+x.port).join(" "))' )" || {
+  echo "cannot read $USERS_FILE" >&2
+  exit 1
+}
+[ -n "$specs" ] || {
+  echo "no users in $USERS_FILE, removing guard rules"
+  exec "$here/dsh-loopback-guard" --remove
+}
+# shellcheck disable=SC2086
+exec "$here/dsh-loopback-guard" --apply $specs

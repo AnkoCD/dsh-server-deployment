@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# dsh-loopback-guard -- keep tenants from reaching each other's DSH instances.
+#
+# Why: every per-user DSH instance listens on 127.0.0.1:<port> and DSH decides
+# "privileged request" by the Host header alone (the gateway itself relies on
+# this). Any tenant's agent can already run arbitrary shell commands, so
+# without this guard tenant A could curl 127.0.0.1:<B-port> with a forged
+# Host header and read/write B's settings, sessions and API-key store.
+# OS-level file isolation cannot see loopback HTTP; the firewall can.
+#
+# Model (v2, destination-scoped): a dedicated iptables OUTPUT chain where
+#   1. each dsh-<name> OS account may connect to its OWN instance port,
+#   2. each dsh-<name> account is REJECTed for every other tenant port and
+#      for the gateway port (spoofing the gateway = spoofing another user),
+#   3. replies (sport = own port) and all non-tenant UIDs pass untouched.
+# NOTE: never reject by uid alone - a blanket per-uid REJECT in OUTPUT also
+# kills the kernel-generated reply path of the tenant's own instance, which
+# turns every tenant connection into a silent timeout.
+#
+# Usage (run as root):
+#   dsh-loopback-guard --apply <osuser>:<port> [<osuser>:<port> ...]
+#     Rebuild the rule set from the FULL user list (idempotent, clears stale
+#     rules first). The gateway port should be passed as gw:<port>.
+#   dsh-loopback-guard --check
+#     Exit 0 if the chain exists and is hooked into OUTPUT.
+#   dsh-loopback-guard --remove
+#     Remove the chain entirely (back to open state).
+#
+# Notes:
+# - IPv4 only: the instances bind 127.0.0.1; ::1 has no listener.
+# - Tenant agents that legitimately need another local TCP service will pass;
+#   extend the REJECT list per service if that ever changes.
+set -euo pipefail
+
+CHAIN=DSH_LOOPBACK_GUARD
+comment="dsh-loopback-guard"
+GW_PORT="${GW_PORT:-3100}"
+
+ipt() { iptables -w 5 "$@"; }
+
+valid_spec() {
+  # <osuser>:<port>, osuser must be dsh-<lowercase alnum/_/->, port numeric.
+  local spec="$1" user="$2" port="$3"
+  if [ -z "$user" ] || [ -z "$port" ]; then
+    echo "invalid spec: $spec (want <osuser>:<port>)" >&2; return 1
+  fi
+  case "$user" in
+    dsh-[a-z0-9_-]*) ;;
+    *) echo "invalid osuser in spec: $spec" >&2; return 1 ;;
+  esac
+  case "$port" in
+    ''|*[!0-9]*) echo "invalid port in spec: $spec" >&2; return 1 ;;
+  esac
+  return 0
+}
+
+hook_output() {
+  if ! ipt -C OUTPUT -o lo -p tcp -j "$CHAIN" 2>/dev/null; then
+    ipt -I OUTPUT 1 -o lo -p tcp -j "$CHAIN"
+  fi
+}
+
+apply_rules() {
+  local specs=("$@") spec user port
+  ipt -N "$CHAIN" 2>/dev/null || true
+  ipt -F "$CHAIN"
+  for spec in "${specs[@]}"; do
+    user="${spec%%:*}"
+    port="${spec##*:}"
+    valid_spec "$spec" "$user" "$port" || exit 2
+    # own instance port: allow (both directions of the flow match by dport
+    # here because replies come from sport; the REJECT rules below are the
+    # only destination-scoped denials)
+    ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$port" -m comment --comment "$comment" -j ACCEPT
+  done
+  for spec in "${specs[@]}"; do
+    user="${spec%%:*}"
+    port="${spec##*:}"
+    valid_spec "$spec" "$user" "$port" || exit 2
+  done
+  for spec in "${specs[@]}"; do
+    user="${spec%%:*}"
+    port="${spec##*:}"
+    # every OTHER tenant's instance port: rejected by destination
+    for other in "${specs[@]}"; do
+      oport="${other##*:}"
+      if [ "$oport" != "$port" ]; then
+        ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$oport" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
+      fi
+    done
+    # the gateway itself: a tenant reaching it loopback could spoof another
+    # user's session through the auth front door
+    ipt -A "$CHAIN" -o lo -p tcp -m owner --uid-owner "$user" --dport "$GW_PORT" -m comment --comment "$comment" -j REJECT --reject-with tcp-reset
+  done
+  ipt -A "$CHAIN" -m comment --comment "$comment" -j RETURN
+  hook_output
+}
+
+case "${1:-}" in
+  --apply)
+    shift
+    [ "$#" -ge 1 ] || { echo "usage: $0 --apply <osuser>:<port> ..." >&2; exit 2; }
+    apply_rules "$@"
+    echo "loopback guard applied to $*"
+    ;;
+  --check)
+    ipt -L "$CHAIN" >/dev/null 2>&1 && ipt -C OUTPUT -o lo -p tcp -j "$CHAIN" 2>/dev/null
+    ;;
+  --remove)
+    ipt -D OUTPUT -o lo -p tcp -j "$CHAIN" 2>/dev/null || true
+    ipt -F "$CHAIN" 2>/dev/null || true
+    ipt -X "$CHAIN" 2>/dev/null || true
+    echo "loopback guard removed"
+    ;;
+  *)
+    echo "usage: $0 --apply <osuser>:<port> [...] | --check | --remove" >&2
+    exit 2
+    ;;
+esac

@@ -1,15 +1,22 @@
 # 路径模板：默认前缀 /opt/deepseek-harness。自定义安装时执行
 #   sed "s|/opt/deepseek-harness|<你的前缀>|g" units/dsh-gateway.service | sudo tee /etc/systemd/system/dsh-gateway.service
+#
+# 安全说明：网关以专用无 shell 系统账号 dsh-gateway 运行（切勿用 ubuntu/
+# admin 等带 NOPASSWD sudo 的云镜像账号），其 sudo 能力仅限
+# /etc/sudoers.d/dsh-upload 白名单中的四个文件助手。
 [Unit]
 Description=DeepSeek Harness Auth Gateway
 After=network-online.target
 Wants=network-online.target
+# 依赖回环租户隔离防火墙（防跨租户访问实例特权接口）
+After=dsh-loopback-guard.service
+Wants=dsh-loopback-guard.service
 
 [Service]
 EnvironmentFile=-/etc/default/dsh-gateway
 Type=simple
-User=ubuntu
-Group=ubuntu
+User=dsh-gateway
+Group=dsh-gateway
 WorkingDirectory=/opt/deepseek-harness/gateway
 Environment=HOST=127.0.0.1
 Environment=PORT=3100
@@ -19,9 +26,18 @@ Environment=USERS_DIR=/opt/deepseek-harness/users
 Environment=DEEPSEEK_BASE_URL=https://api.deepseek.com
 Environment=COOKIE_SECURE=1
 Environment=SESSION_TTL=43200
-ExecStart=/usr/bin/node /opt/deepseek-harness/gateway/server.js
+ExecStart=/usr/bin/node /opt/deepseek-harness/gateway/server.cjs
 Restart=on-failure
 RestartSec=3
+# 会话 secret 与上传缓冲常驻内存；限制网关自身的资源占用
+MemoryMax=1G
+TasksMax=256
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+# 路径模板：默认前缀 /opt/deepseek-harness。自定义安装时执行
+#   sed "s|/opt/deepseek-harness|<你的前缀>|g" units/dsh-loopback-guard.service | sudo tee /etc/systemd/system/dsh-loopback-guard.service
+# 用户/端口映射从 users.json 读取（可用 USERS_FILE 环境变量覆盖），
+# 每次启动重建 iptables 规则；userctl 增删用户时也会即时刷新。
+[Unit]
+Description=DSH loopback tenant isolation (iptables)
+After=network-online.target
+Wants=network-online.target
+# 规则基于 users.json 的用户/端口映射，需在用户实例启动前生效
+Before=dsh-web-*.service
+
+[Service]
+Type=oneshot
+Environment=USERS_FILE=/opt/deepseek-harness/gateway/users.json
+ExecStart=/opt/deepseek-harness/bin/dsh-loopback-guard-apply
+RemainAfterExit=yes
+ExecStop=/opt/deepseek-harness/bin/dsh-loopback-guard --remove
+
+[Install]
+WantedBy=multi-user.target

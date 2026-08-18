@@ -17,6 +17,16 @@ const MIN_PORT = 3101;
 
 function fail(msg) { console.error('error: ' + msg); process.exit(1); }
 function validUser(n) { return typeof n === 'string' && /^[A-Za-z0-9_-]+$/.test(n); }
+// usernames differing only in case map to the SAME OS account (dsh-<lower>),
+// which would silently merge two portal users' file spaces; forbid duplicates
+// by lowercase form at every entry point that creates users.
+function caseConflict(db, name) {
+  const lower = String(name).toLowerCase();
+  for (const k of Object.keys(db.users || {})) {
+    if (k !== name && k.toLowerCase() === lower) return k;
+  }
+  return null;
+}
 
 // OS account per DSH user: 'dsh-' + lowercase(username). Each user's DSH
 // instance runs as its own OS account so one user cannot read another's files.
@@ -41,9 +51,17 @@ function loadUsers() {
 }
 function saveUsers(db) {
   fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(USERS_FILE, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
-  try { execFileSync('chown', ['ubuntu:ubuntu', USERS_FILE]); } catch (e) {}
+  // Atomic write (temp + rename): a crash mid-write must never leave a
+  // truncated users.json - the gateway would treat it as "no users".
+  const tmp = USERS_FILE + '.tmp-' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
+  try { execFileSync('chown', [GATEWAY_OWNER + ':' + GATEWAY_OWNER, tmp]); } catch (e) {}
+  fs.renameSync(tmp, USERS_FILE);
 }
+// Owner of gateway runtime files (users.json / secret / state-cwd.json).
+// Override with DSH_GATEWAY_OWNER when the gateway runs as a dedicated
+// service account instead of the deploy user.
+const GATEWAY_OWNER = process.env.DSH_GATEWAY_OWNER || 'dsh-gateway';
 function allocPort(db) {
   const used = new Set();
   for (const k in (db.users || {})) used.add(db.users[k].port);
@@ -128,6 +146,26 @@ function unitFor(name, port) {
     'ExecStart=' + NODE_BIN + ' ' + DSH_BIN + ' --profile web --host 127.0.0.1 --port ' + port + ' --trusted-host ' + TRUSTED_HOST,
     'Restart=on-failure',
     'RestartSec=5',
+    // Basic fairness limits: one tenant\'s runaway agent (fork bombs, memory
+    // leaks, crypto miners) must not starve the other instances or the host.
+    'TasksMax=512',
+    'MemoryMax=' + (process.env.DSH_MEM_MAX || '2G'),
+    'CPUQuota=' + (process.env.DSH_CPU_QUOTA || '200%'),
+    'LimitNOFILE=8192',
+    // Kernel-level hardening; note NoNewPrivileges/ProtectSystem=strict are
+    // deliberately NOT set: DSH agents execute arbitrary shell commands that
+    // legitimately use sudo/writable HOME.
+    'ProtectKernelTunables=yes',
+    'ProtectKernelModules=yes',
+    'ProtectKernelLogs=yes',
+    'ProtectControlGroups=yes',
+    'ProtectClock=yes',
+    'ProtectHostname=yes',
+    'PrivateTmp=yes',
+    'RestrictRealtime=yes',
+    'RestrictSUIDSGID=yes',
+    'LockPersonality=yes',
+    'MemoryDenyWriteExecute=no',
     '',
     '[Install]',
     'WantedBy=multi-user.target',
@@ -145,6 +183,25 @@ function removeUnit(name) {
   try { execFileSync('systemctl', ['disable', '--now', unit]); } catch (e) {}
   try { fs.unlinkSync('/etc/systemd/system/' + unit); } catch (e) {}
   try { execFileSync('systemctl', ['daemon-reload']); } catch (e) {}
+}
+
+// Re-apply the loopback firewall (bin/dsh-loopback-guard) after any change to
+// the user set. Failure is non-fatal: the guard also runs from its own
+// systemd unit, this is just immediate consistency.
+function refreshLoopbackGuard(db) {
+  const guard = path.join(path.dirname(USERS_FILE), '..', 'bin', 'dsh-loopback-guard');
+  const args = [guard, '--apply'];
+  for (const n of Object.keys(db.users || {})) {
+    const u = db.users[n];
+    if (u && u.port && u.osUser) args.push(u.osUser + ':' + u.port);
+  }
+  try { execFileSync(guard, args); }
+  catch (e) {
+    try {
+      const spec = args.slice(2).map((s) => "'" + s.replace(/'/g, "'\\''") + "'").join(' ');
+      execFileSync('bash', ['-c', "'" + guard.replace(/'/g, "'\\''") + "' --apply " + spec]);
+    } catch (e2) { console.error('loopback guard refresh failed:', e2.message); }
+  }
 }
 
 function promptHidden(promptText) {
@@ -219,15 +276,18 @@ async function main() {
 
   if (cmd === 'add') {
     if (db.users[user]) fail('user already exists: ' + user);
+    const clash = caseConflict(db, user);
+    if (clash) fail('username conflicts with existing user "' + clash + '" (OS account is lowercase, files would merge)');
     const password = rest[0] || await promptHidden('Password: ');
     if (!password) fail('password required');
     const port = allocPort(db);
     const osu = osUserOf(user);
     createOsUser(user);
-    db.users[user] = { port: port, home: homeOf(user), osUser: osu, pwd: hashPassword(password), keyConfigured: false, created: new Date().toISOString() };
+    db.users[user] = { port: port, home: homeOf(user), osUser: osu, pwd: hashPassword(password), pwdVer: 1, keyConfigured: false, created: new Date().toISOString() };
     createHome(user);
     saveUsers(db);
     writeUnit(user, port);
+    refreshLoopbackGuard(db);
     console.log('Created user: ' + user + ' (port ' + port + ', os ' + osu + ')');
     return;
   }
@@ -237,8 +297,10 @@ async function main() {
     const password = rest[0] || await promptHidden('New password: ');
     if (!password) fail('password required');
     db.users[user].pwd = hashPassword(password);
+    // Invalidate every outstanding gateway session token (tokens embed pwdVer).
+    db.users[user].pwdVer = (typeof db.users[user].pwdVer === 'number' ? db.users[user].pwdVer : 0) + 1;
     saveUsers(db);
-    console.log('Password updated: ' + user + ' (now scrypt)');
+    console.log('Password updated: ' + user + ' (now scrypt, sessions revoked)');
     return;
   }
 
@@ -254,6 +316,7 @@ async function main() {
     try { fs.rmSync(homeOf(user), { recursive: true, force: true }); } catch (e) {}
     delete db.users[user];
     saveUsers(db);
+    refreshLoopbackGuard(db);
     console.log('Deleted user: ' + user);
     return;
   }
@@ -289,7 +352,9 @@ async function main() {
     stripGatewayAcl(homeOf(user));
     db.users[user].osUser = osu;
     if (db.users[user].keyConfigured === undefined) db.users[user].keyConfigured = hasApiKey(USERS_DIR, user);
+    if (typeof db.users[user].pwdVer !== 'number') db.users[user].pwdVer = 1;
     saveUsers(db);
+    refreshLoopbackGuard(db);
     const file = '/etc/systemd/system/dsh-web-' + user + '.service';
     fs.writeFileSync(file, unitFor(user, db.users[user].port), { mode: 0o644 });
     execFileSync('systemctl', ['daemon-reload']);
@@ -301,14 +366,17 @@ async function main() {
   if (cmd === 'seed-legacy') {
     const apr1 = rest[0];
     if (db.users[user]) fail('user already exists: ' + user);
+    const clash = caseConflict(db, user);
+    if (clash) fail('username conflicts with existing user "' + clash + '" (OS account is lowercase, files would merge)');
     if (!apr1 || apr1.indexOf('$apr1$') !== 0) fail('seed-legacy requires an $apr1$ hash');
     const port = allocPort(db);
     const osu = osUserOf(user);
     createOsUser(user);
-    db.users[user] = { port: port, home: homeOf(user), osUser: osu, pwd: { algo: 'apr1', value: apr1 }, keyConfigured: false, created: new Date().toISOString() };
+    db.users[user] = { port: port, home: homeOf(user), osUser: osu, pwd: { algo: 'apr1', value: apr1 }, pwdVer: 1, keyConfigured: false, created: new Date().toISOString() };
     createHome(user);
     saveUsers(db);
     writeUnit(user, port);
+    refreshLoopbackGuard(db);
     console.log('Seeded legacy user: ' + user + ' (port ' + port + ', os ' + osu + ')');
     return;
   }

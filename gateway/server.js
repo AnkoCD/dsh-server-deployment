@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
-const { execFileSync, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const zlib = require('zlib');
 const { verifyPassword, timingSafeStr } = require('./auth.js');
 
@@ -72,13 +72,24 @@ function loadUsers() {
   if (now - usersCacheAt < 2000) return usersCache;
   try {
     usersCache = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-  } catch (e) { usersCache = { version: 1, users: {} }; }
+  } catch (e) {
+    // A corrupt store must be loud, not silently "no users" (lockout for
+    // everyone + impossible to debug from the outside).
+    console.error('users.json parse failed, keeping last known cache:', e.message);
+  }
   usersCacheAt = now;
   return usersCache;
 }
 function getUser(name) {
   const u = loadUsers().users;
   return (u && u[name]) || null;
+}
+// Password generation: bumped by userctl on every password change so all
+// outstanding session tokens (which embed pwdVer) become invalid - otherwise
+// a stolen 12h token would survive a password reset.
+function pwdVersion(user) {
+  const u = getUser(user);
+  return (u && typeof u.pwdVer === 'number') ? u.pwdVer : 0;
 }
 
 // Whether the user already configured an API key (flag lives in users.json,
@@ -88,15 +99,27 @@ function hasKey(user) {
   return !!(u && u.keyConfigured);
 }
 
+// Atomically update one user record inside users.json (read-modify-write via
+// temp file + rename) so a crash never leaves a truncated store and the
+// in-memory cache is refreshed immediately.
+function mutateUserStore(user, fn) {
+  let db;
+  try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); }
+  catch (e) { db = { version: 1, users: {} }; }
+  if (db.users && db.users[user]) fn(db.users[user]);
+  try {
+    const tmp = USERS_FILE + '.tmp-' + process.pid + '-' + Date.now().toString(36);
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 });
+    fs.renameSync(tmp, USERS_FILE);
+  } catch (e) { console.error('users.json write failed:', e.message); }
+  usersCache = db;
+  usersCacheAt = Date.now();
+}
+
 // Persist the flag and refresh the in-memory cache so the very next request
 // sees it (no 2s staleness on the /setup -> / redirect).
 function setUserKeyFlag(user, val) {
-  let db;
-  try { db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch (e) { db = { version: 1, users: {} }; }
-  if (db.users && db.users[user]) db.users[user].keyConfigured = !!val;
-  try { fs.writeFileSync(USERS_FILE, JSON.stringify(db, null, 2) + '\n', { mode: 0o640 }); } catch (e) { console.error('setUserKeyFlag write failed:', e.message); }
-  usersCache = db;
-  usersCacheAt = Date.now();
+  mutateUserStore(user, (rec) => { rec.keyConfigured = !!val; });
 }
 
 // Ask the user's own DSH instance to persist the key. The instance's credentials
@@ -130,9 +153,19 @@ function rpcCredentialsSet(port, key) {
 // ---------- rate limiting ----------
 const ipFails = new Map();
 const userFails = new Map();
+const DUMMY_SALT = crypto.randomBytes(16); // timing-equalizer for unknown users
 function clientIp(req) {
+  // The gateway sits behind exactly one trusted TLS proxy (OpenResty) that we
+  // control and that OVERWRITES X-Forwarded-For with $remote_addr, so the
+  // header - when present - carries only the real client address. If anything
+  // else reaches us without that header (direct loopback access, a mis-set
+  // proxy), fall back to the socket address. Never trust a comma-separated
+  // list here: an attacker-supplied XFF would otherwise spoof the rate limiter.
   const xff = req.headers['x-forwarded-for'];
-  if (xff) return String(xff).split(',')[0].trim();
+  if (xff) {
+    const first = String(xff).split(',')[0].trim();
+    if (first) return first;
+  }
   return req.socket.remoteAddress || 'unknown';
 }
 function lockedUntil(map, key) {
@@ -170,7 +203,7 @@ function recordSuccess(req, username) {
 
 // ---------- session ----------
 function makeToken(user) {
-  const payload = { u: user, exp: Math.floor(Date.now() / 1000) + SESSION_TTL, n: crypto.randomBytes(8).toString('hex') };
+  const payload = { u: user, v: pwdVersion(user), exp: Math.floor(Date.now() / 1000) + SESSION_TTL, n: crypto.randomBytes(8).toString('hex') };
   const b = Buffer.from(JSON.stringify(payload)).toString('base64url');
   return b + '.' + hmac(b);
 }
@@ -206,6 +239,8 @@ function getSession(req) {
   const p = verifyToken(tok);
   if (!p || !p.u) return null;
   if (!getUser(p.u)) return null;
+  // Reject tokens minted before the current password generation.
+  if (typeof p.v === 'number' && p.v !== pwdVersion(p.u)) return null;
   return p;
 }
 function cookieHeader(name, value, opts) {
@@ -417,6 +452,38 @@ function json(res, code, obj) {
 function redirect(res, loc) {
   res.writeHead(302, { Location: loc, 'Cache-Control': 'no-store' });
   res.end();
+}
+
+// ---------- async sudo helper wrappers ----------
+// All helper invocations use async spawn so a slow runuser call can never
+// block the event loop (the old execFileSync stalled EVERY user's traffic
+// for the duration of a listing/upload).
+function runHelper(args, opts) {
+  return new Promise((resolve) => {
+    const o = Object.assign({ timeoutMs: 15000, maxStdout: 8 * 1024 * 1024 }, opts || {});
+    let child;
+    try {
+      child = spawn('sudo', ['-n'].concat(args), { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) { return resolve({ code: null, stdout: '', stderr: String(e && e.message || e) }); }
+    let out = [];
+    let outLen = 0;
+    let err = '';
+    let done = false;
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, o.timeoutMs);
+    const finish = (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ code: code, stdout: Buffer.concat(out).toString('utf8'), stderr: err });
+    };
+    child.stdout.on('data', (c) => {
+      outLen += c.length;
+      if (outLen <= o.maxStdout) out.push(c);
+    });
+    child.stderr.on('data', (c) => { err += c.toString('utf8'); });
+    child.on('error', () => finish(null));
+    child.on('close', (code) => finish(code));
+  });
 }
 
 // ---------- user file browser & download (deliverables) ----------
@@ -856,7 +923,13 @@ const server = http.createServer(async (req, res) => {
         return res.end(loginPage(csrf2, '尝试次数过多，请 ' + attempt.retryAfter + ' 秒后重试'));
       }
       const u = getUser(username);
-      if (!u || !u.pwd || !verifyPassword(password, u.pwd)) {
+      // Always run a scrypt pass, even for unknown users, so response timing
+      // does not reveal which usernames exist (only the per-user lockout map
+      // would otherwise distinguish them).
+      let ok = false;
+      if (u && u.pwd) ok = verifyPassword(password, u.pwd);
+      else crypto.scryptSync(password, DUMMY_SALT, 64);
+      if (!ok) {
         recordFailure(req, username);
         logLine(req, 401, 'bad-creds ' + username);
         const csrf2 = crypto.randomBytes(16).toString('hex');
@@ -874,6 +947,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === '/logout') {
+    // POST-only + same-site token so a third-party page cannot log users out
+    // cross-site (GET /logout used to allow exactly that). The SPA login page
+    // has no logout button of its own; callers should POST with the CSRF
+    // cookie echoed in the body.
+    if (req.method !== 'POST') return redirect(res, '/');
+    if (session) {
+      const c = parseCookies(req);
+      let body = '';
+      try { body = await readBody(req, 4096); } catch (e) {}
+      const form = parseForm(body);
+      const tok = form.csrf || req.headers['x-csrf-token'] || '';
+      if (!c[CSRF_COOKIE] || !timingSafeStr(String(tok), c[CSRF_COOKIE])) {
+        return json(res, 403, { ok: false, error: 'CSRF 校验失败' });
+      }
+    }
     clearSession(res);
     return redirect(res, '/login');
   }
@@ -932,14 +1020,15 @@ const server = http.createServer(async (req, res) => {
       // else the workspace default (canonicalized by the list helper).
       let target = String(q.dir || '') || currentCwd(session.u) || '';
       let display = home;
-      try {
-        const out = execFileSync('sudo', ['-n', FILE_LIST_HELPER, home, target], { timeout: 15000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
-        display = JSON.parse(out).dir;
-      } catch (e) {
-        try {
-          const out2 = execFileSync('sudo', ['-n', FILE_LIST_HELPER, home, ''], { timeout: 15000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
-          display = JSON.parse(out2).dir;
-        } catch (e2) {}
+      {
+        const r = await runHelper([FILE_LIST_HELPER, home, target]);
+        let parsed = null;
+        try { parsed = JSON.parse(r.stdout); } catch (e) {}
+        if (parsed && parsed.dir) display = parsed.dir;
+        else {
+          const r2 = await runHelper([FILE_LIST_HELPER, home, '']);
+          try { display = JSON.parse(r2.stdout).dir; } catch (e) {}
+        }
       }
       const body = [
         '<div class="dlcard' + (embed ? ' embed' : '') + '">',
@@ -1012,17 +1101,32 @@ const server = http.createServer(async (req, res) => {
     }
     let buf;
     try { buf = await readBodyBuf(req, UPLOAD_MAX_MB * 1024 * 1024); } catch (e) { return json(res, 413, { ok: false, error: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' }); }
+    // Stream into the root helper (which demotes to dsh-<name> before writing)
+    // instead of buffering + execFileSync: no event-loop stall on big uploads.
     let saved = { ok: false, status: 500, detail: '上传失败' };
-    try {
-      execFileSync('sudo', ['-n', UPLOAD_HELPER, home, dirAbs, name], { input: buf, maxBuffer: 1024 * 1024, timeout: 120000, stdio: ['pipe', 'ignore', 'pipe'] });
-      saved = { ok: true, status: 200, detail: '' };
-    } catch (e) {
-      const code = (e && typeof e.status === 'number') ? e.status : 0;
-      if (code === 2) saved = { ok: false, status: 400, detail: '文件名不合法' };
+    {
+      const r = await new Promise((resolve) => {
+        let child;
+        try {
+          child = spawn('sudo', ['-n', UPLOAD_HELPER, home, dirAbs, name], { stdio: ['pipe', 'ignore', 'pipe'] });
+        } catch (e) { return resolve({ code: null }); }
+        let stderr = '';
+        let done = false;
+        const finish = (code) => { if (!done) { done = true; clearTimeout(timer); resolve({ code: code, stderr: stderr }); } };
+        const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 120000);
+        child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
+        child.on('error', () => finish(null));
+        child.on('close', (code) => finish(code));
+        child.stdin.on('error', () => {}); // EPIPE if helper rejected args early
+        child.stdin.end(buf);
+      });
+      const code = r.code;
+      if (code === 0) saved = { ok: true, status: 200, detail: '' };
+      else if (code === 2) saved = { ok: false, status: 400, detail: '文件名不合法' };
       else if (code === 3) saved = { ok: false, status: 403, detail: '目标目录超出你的工作区' };
       else if (code === 4) saved = { ok: false, status: 404, detail: '目标目录不存在' };
       else if (code === 5) saved = { ok: false, status: 413, detail: '文件过大' };
-      else saved = { ok: false, status: 500, detail: '写入失败：' + ((e && e.message) ? String(e.message).split('\n')[0] : '未知错误') };
+      else saved = { ok: false, status: 500, detail: '写入失败：' + ((r.stderr && r.stderr.split('\n')[0]) ? String(r.stderr).split('\n')[0] : '未知错误') };
     }
     if (!saved.ok) return json(res, saved.status, { ok: false, error: saved.detail });
     const target = path.join(dirAbs, name);
@@ -1051,15 +1155,13 @@ const server = http.createServer(async (req, res) => {
       // All file access runs through the pinned root helpers: the gateway's
       // service account has no read access to user homes by design.
       let size = -1;
-      try {
-        const out = execFileSync('sudo', ['-n', FILE_STAT_HELPER, home, abs], { timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8').trim();
-        size = parseInt(out, 10);
+      {
+        const r = await runHelper([FILE_STAT_HELPER, home, abs], { maxStdout: 1024 * 1024 });
+        if (r.code === 3) return json(res, 403, { ok: false, error: '路径超出你的工作区' });
+        if (r.code === 5) return json(res, 403, { ok: false, error: '不允许下载隐藏文件' });
+        if (r.code !== 0) return json(res, 404, { ok: false, error: '文件不存在' });
+        size = parseInt(r.stdout.trim(), 10);
         if (!Number.isFinite(size)) size = -1;
-      } catch (e) {
-        const code = (e && typeof e.status === 'number') ? e.status : 0;
-        if (code === 3) return json(res, 403, { ok: false, error: '路径超出你的工作区' });
-        if (code === 5) return json(res, 403, { ok: false, error: '不允许下载隐藏文件' });
-        return json(res, 404, { ok: false, error: '文件不存在' });
       }
       const ascii = base.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'download';
       secHeaders(res);
@@ -1096,19 +1198,19 @@ const server = http.createServer(async (req, res) => {
     // SPA's session RPCs), else the workspace directory.
     const dirParam = String(q.dir || '') || currentCwd(session.u) || '';
     let listing = null;
-    try {
-      const out = execFileSync('sudo', ['-n', FILE_LIST_HELPER, home, dirParam], { timeout: 15000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
-      listing = JSON.parse(out);
-    } catch (e) {
-      const code = (e && typeof e.status === 'number') ? e.status : 0;
-      if (code === 3 && !q.dir) {
-        try {
-          const out2 = execFileSync('sudo', ['-n', FILE_LIST_HELPER, home, ''], { timeout: 15000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8');
-          listing = JSON.parse(out2);
-        } catch (e2) {
-          return json(res, 404, { ok: false, error: '目录不存在或无法读取' });
-        }
-      } else {
+    {
+      const r = await runHelper([FILE_LIST_HELPER, home, dirParam]);
+      let parsed = null;
+      try { parsed = JSON.parse(r.stdout); } catch (e) {}
+      if (parsed && Array.isArray(parsed.entries)) {
+        listing = parsed;
+      } else if (r.code === 3 && !q.dir) {
+        // tracked cwd went stale/out of scope - fall back to the workspace root
+        const r2 = await runHelper([FILE_LIST_HELPER, home, '']);
+        try { listing = JSON.parse(r2.stdout); } catch (e2) {}
+      }
+      if (!listing) {
+        const code = r.code;
         return json(res, code === 3 ? 403 : 404, { ok: false, error: code === 3 ? '路径超出你的工作区' : '目录不存在或无法读取' });
       }
     }
@@ -1229,3 +1331,11 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, HOST, () => {
   console.log('dsh-gateway listening on ' + HOST + ':' + PORT);
 });
+
+// Graceful shutdown: stop accepting, let in-flight proxies/uploads finish.
+function shutdown() {
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
