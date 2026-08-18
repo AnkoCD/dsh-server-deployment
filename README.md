@@ -1,5 +1,7 @@
 # DeepSeek Harness 服务器部署（dsh-server-deployment）
 
+[简体中文](README.md) | [English](README.en.md)
+
 <p align="center">
   <img src="assets/cover.png" alt="DSH 服务器部署封面" width="100%">
 </p>
@@ -105,7 +107,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 - 每用户实例带 systemd 资源限制（TasksMax/MemoryMax/CPUQuota，可经 `DSH_MEM_MAX`/`DSH_CPU_QUOTA` 调整）与内核加固项。
 - 文件助手（dsh-file-put/read/stat/list）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。**上传助手为 v2 长度协议**（`BYTES <n>` 头 + 精确字节校验）：网关流式转发请求体，中断/超时/超限的上传会以 exit 6 拒绝提交，不会留下截断文件。
 - 用户凭据文件必须保持仅属主可读（0600）：DSH 启动时会强制检查（`assertOwnerOnly`）。本网关的 root 助手模型天然满足，不要给用户目录添加任何 ACL 读取授权（曾因此触发实例拒绝启动）。
-- 网关与所有实例仅监听 127.0.0.1，公网只暴露 TLS 反代；反代必须**覆盖**（非追加）`X-Forwarded-For` 为 `$remote_addr`（见 nginx 配置），否则攻击者可伪造 XFF 绕过网关 IP 限流。
+- 网关与所有实例仅监听 127.0.0.1，公网只暴露 TLS 反代；反代必须**覆盖**（非追加）`X-Forwarded-For` 为 `$remote_addr`（`nginx/dsh-https-1145.conf` 模板已按此安全默认值配置），否则攻击者可伪造 XFF 绕过网关 IP 限流。
 - 登录限流为 IP + 账号两级；账号锁定（5 次/15 分钟）本身可被滥用作 DoS，仅靠 IP 级限流与强密码缓解。改密会使 `pwdVer` 递增，所有已签发会话立即失效（含无版本号的旧令牌）。
 - `/logout` 仅接受 POST（带 CSRF 双提交校验），防跨站登出。
 - 升级 DSH 后如需客户端行为修补（如 settings 持久化作用域），请自行评估，本仓库不修改 npm 包。
