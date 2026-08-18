@@ -239,8 +239,10 @@ function getSession(req) {
   const p = verifyToken(tok);
   if (!p || !p.u) return null;
   if (!getUser(p.u)) return null;
-  // Reject tokens minted before the current password generation.
-  if (typeof p.v === 'number' && p.v !== pwdVersion(p.u)) return null;
+  // Reject tokens minted before the current password generation. Tokens
+  // without a generation number are pre-migration relics: they must not
+  // outlive a password reset either.
+  if ((p.v || 0) !== pwdVersion(p.u)) return null;
   return p;
 }
 function cookieHeader(name, value, opts) {
@@ -1099,33 +1101,76 @@ const server = http.createServer(async (req, res) => {
     if (!name || name.length > 200 || name.indexOf('\0') >= 0 || /[\/\\]/.test(name) || name === '.' || name === '..' || name.startsWith('.') || /[\x00-\x1f\x7f]/.test(name)) {
       return json(res, 400, { ok: false, error: '文件名不合法' });
     }
-    let buf;
-    try { buf = await readBodyBuf(req, UPLOAD_MAX_MB * 1024 * 1024); } catch (e) { return json(res, 413, { ok: false, error: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' }); }
-    // Stream into the root helper (which demotes to dsh-<name> before writing)
-    // instead of buffering + execFileSync: no event-loop stall on big uploads.
+    // True streaming: the request body is piped straight into the root
+    // helper's stdin (which demotes to dsh-<name> before writing) with
+    // backpressure - constant memory regardless of file size. Completeness is
+    // enforced end-to-end: we require Content-Length and tell the helper the
+    // exact byte count ("BYTES <n>\n" protocol); the helper refuses to commit
+    // a short stream (exit 6), so an aborted / timed-out / oversized upload
+    // can never leave a truncated file behind.
+    const LIMIT = UPLOAD_MAX_MB * 1024 * 1024;
+    const contentLength = parseInt(req.headers['content-length'] || '', 10);
+    if (!Number.isFinite(contentLength) || contentLength < 0) return json(res, 411, { ok: false, error: '缺少 Content-Length' });
+    if (contentLength > LIMIT) return json(res, 413, { ok: false, error: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' });
     let saved = { ok: false, status: 500, detail: '上传失败' };
     {
       const r = await new Promise((resolve) => {
         let child;
         try {
           child = spawn('sudo', ['-n', UPLOAD_HELPER, home, dirAbs, name], { stdio: ['pipe', 'ignore', 'pipe'] });
-        } catch (e) { return resolve({ code: null }); }
+        } catch (e) { return resolve({ code: null, stderr: String((e && e.message) || e) }); }
         let stderr = '';
         let done = false;
-        const finish = (code) => { if (!done) { done = true; clearTimeout(timer); resolve({ code: code, stderr: stderr }); } };
-        const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 120000);
+        let over = false;      // gateway-side cap tripped mid-stream (defence in depth)
+        let timedOut = false;
+        let aborted = false;
+        let reqEnded = false;
+        let paused = false;
+        let size = 0;
+        const finish = (code) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          // Close our end of the pipe so an orphaned helper (sudo killed on
+          // timeout/abort) sees EOF, verifies its byte count, and lets the
+          // EXIT trap clean the temp file.
+          try { child.stdin.destroy(); } catch (e) {}
+          resolve({ code: code, stderr: stderr, over: over, timedOut: timedOut, aborted: aborted });
+        };
+        const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch (e) {} }, 600000);
         child.stderr.on('data', (c) => { stderr += c.toString('utf8'); });
         child.on('error', () => finish(null));
         child.on('close', (code) => finish(code));
-        child.stdin.on('error', () => {}); // EPIPE if helper rejected args early
-        child.stdin.end(buf);
+        child.stdin.on('error', () => {}); // EPIPE when the helper rejected args early
+        try { child.stdin.write('BYTES ' + contentLength + '\n'); } catch (e) {}
+        req.on('data', (c) => {
+          if (done || over) return; // over: draining the remainder of a doomed body
+          size += c.length;
+          if (size > LIMIT) {
+            over = true;
+            try { child.kill('SIGKILL'); } catch (e) {}
+            finish(null);
+            req.resume();
+            return;
+          }
+          let writable = true;
+          try { writable = child.stdin.write(c); } catch (e) { writable = false; }
+          if (!writable && !paused) { paused = true; req.pause(); }
+        });
+        child.stdin.on('drain', () => { if (paused && !done && !over) { paused = false; req.resume(); } });
+        req.on('end', () => { reqEnded = true; if (!done && !over) { try { child.stdin.end(); } catch (e) {} } });
+        req.on('error', () => { if (!done) { aborted = true; try { child.kill('SIGKILL'); } catch (e) {} finish(null); } });
+        req.on('close', () => { if (!done && !reqEnded) { aborted = true; try { child.kill('SIGKILL'); } catch (e) {} finish(null); } });
       });
-      const code = r.code;
-      if (code === 0) saved = { ok: true, status: 200, detail: '' };
-      else if (code === 2) saved = { ok: false, status: 400, detail: '文件名不合法' };
-      else if (code === 3) saved = { ok: false, status: 403, detail: '目标目录超出你的工作区' };
-      else if (code === 4) saved = { ok: false, status: 404, detail: '目标目录不存在' };
-      else if (code === 5) saved = { ok: false, status: 413, detail: '文件过大' };
+      if (r.over) saved = { ok: false, status: 413, detail: '文件过大（上限 ' + UPLOAD_MAX_MB + ' MB）' };
+      else if (r.timedOut) saved = { ok: false, status: 504, detail: '上传超时' };
+      else if (r.aborted) saved = { ok: false, status: 400, detail: '上传中断' };
+      else if (r.code === 0) saved = { ok: true, status: 200, detail: '' };
+      else if (r.code === 2) saved = { ok: false, status: 400, detail: '文件名不合法' };
+      else if (r.code === 3) saved = { ok: false, status: 403, detail: '目标目录超出你的工作区' };
+      else if (r.code === 4) saved = { ok: false, status: 404, detail: '目标目录不存在' };
+      else if (r.code === 5) saved = { ok: false, status: 413, detail: '文件过大' };
+      else if (r.code === 6) saved = { ok: false, status: 400, detail: '上传中断（数据不完整）' };
       else saved = { ok: false, status: 500, detail: '写入失败：' + ((r.stderr && r.stderr.split('\n')[0]) ? String(r.stderr).split('\n')[0] : '未知错误') };
     }
     if (!saved.ok) return json(res, saved.status, { ok: false, error: saved.detail });

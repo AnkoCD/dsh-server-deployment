@@ -187,7 +187,8 @@ function removeUnit(name) {
 
 // Re-apply the loopback firewall (bin/dsh-loopback-guard) after any change to
 // the user set. Failure is non-fatal: the guard also runs from its own
-// systemd unit, this is just immediate consistency.
+// systemd unit, this is just immediate consistency - but a failed refresh
+// means the new port map is NOT enforced, so print it loudly.
 function refreshLoopbackGuard(db) {
   const guard = path.join(path.dirname(USERS_FILE), '..', 'bin', 'dsh-loopback-guard');
   const args = [guard, '--apply'];
@@ -196,12 +197,7 @@ function refreshLoopbackGuard(db) {
     if (u && u.port && u.osUser) args.push(u.osUser + ':' + u.port);
   }
   try { execFileSync(guard, args); }
-  catch (e) {
-    try {
-      const spec = args.slice(2).map((s) => "'" + s.replace(/'/g, "'\\''") + "'").join(' ');
-      execFileSync('bash', ['-c', "'" + guard.replace(/'/g, "'\\''") + "' --apply " + spec]);
-    } catch (e2) { console.error('loopback guard refresh failed:', e2.message); }
-  }
+  catch (e) { console.error('WARNING: loopback guard refresh failed - tenant isolation rules NOT updated:', e.message); }
 }
 
 function promptHidden(promptText) {

@@ -2,9 +2,14 @@
 # dsh-file-put <home> <dir> <name> -- write stdin into <dir>/<name>.
 # Invoked via sudo (see /etc/sudoers.d/dsh-upload) by the gateway for web uploads.
 #
+# Protocol (v2, streaming): stdin is one header line "BYTES <n>" followed by
+# exactly n raw bytes. A stream that ends early exits 6 WITHOUT committing,
+# so an aborted / timed-out / oversized upload can never leave a truncated
+# file behind (the old version committed whatever cat had received).
+#
 # Security model (fixes issue #1 TOCTOU): root performs ONLY string
 # validation of arguments and derives the target OS user; every filesystem
-# operation (mktemp/cat/stat/chmod/mv) runs as that unprivileged user via
+# operation (mktemp/head/stat/chmod/mv) runs as that unprivileged user via
 # runuser. A symlink swap race can therefore only redirect the write into
 # locations the user can already write - no privilege boundary left to cross.
 # The realpath prefix checks below are best-effort UX (stable exit codes),
@@ -37,10 +42,16 @@ case "$pd" in "$hd"|"$hd"/*) ;; *) exit 3 ;; esac
 exec runuser -u "$osu" -- bash -c '
   set -euo pipefail
   dir="$1"; name="$2"; max="$3"
+  # default IFS splits "BYTES <n>" on the space; an "IFS=" prefix here would
+  # disable splitting and break the magic check
+  read -r magic n
+  [ "$magic" = "BYTES" ] || exit 2
+  case "$n" in ""|*[!0-9]*) exit 2 ;; esac
+  [ "$n" -le "$max" ] || exit 5
   tmp="$(mktemp "$dir/.dsh-up.XXXXXX")" || exit 4
   trap '\''rm -f "$tmp"'\'' EXIT
-  cat > "$tmp"
-  [ "$(stat -c%s "$tmp")" -gt "$max" ] && exit 5
+  head -c "$n" > "$tmp"
+  [ "$(stat -c%s "$tmp")" -eq "$n" ] || exit 6
   chmod 0644 "$tmp"
   mv -f "$tmp" "$dir/$name"
   trap - EXIT

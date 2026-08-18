@@ -121,6 +121,13 @@ function check(name, cond) {
   const db = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
   check('flag set after setup', db.users.nokey.keyConfigured === true);
 
+  r = await req('POST', '/logout', { headers: { Cookie: 'dsh_session=' + sess + '; dsh_csrf=' + csrf2 }, body: 'csrf=' + csrf2 });
+  check('logout POST -> 302 /login', r.status === 302 && r.headers.location === '/login');
+  r = await req('POST', '/logout', { headers: { Cookie: 'dsh_session=' + sess }, body: 'csrf=' + csrf2 });
+  check('logout POST w/o csrf cookie -> 403', r.status === 403);
+  r = await req('GET', '/logout');
+  check('logout GET -> 302 /', r.status === 302 && r.headers.location === '/');
+
   r = await req('GET', '/api/something');
   check('unauth api -> 401', r.status === 401);
 

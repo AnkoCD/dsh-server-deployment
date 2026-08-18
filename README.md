@@ -67,7 +67,7 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
    ```bash
    H=/opt/deepseek-harness/users/<user>
    sudo -n /opt/deepseek-harness/bin/dsh-file-list "$H" ''          # JSON 目录列表
-   echo hello | sudo -n /opt/deepseek-harness/bin/dsh-file-put "$H" "$H/workspace" t.txt
+   printf 'BYTES 6\nhello\n' | sudo -n /opt/deepseek-harness/bin/dsh-file-put "$H" "$H/workspace" t.txt   # v2 长度协议；短流 exit=6 不落盘
    sudo -n /opt/deepseek-harness/bin/dsh-file-stat  "$H" "$H/workspace/t.txt"   # 输出 6
    sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" "$H/workspace/t.txt"   # 输出 hello
    sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" /etc/passwd; echo "exit=$?"  # exit=3（越界拒绝）
@@ -98,14 +98,15 @@ nginx/                  # TLS 反向代理示例配置（已占位化域名）
 
 ## 安全注意事项
 
-- `bin/` 与 `gateway/` 目录必须保持 root:root 权限（0755，无组/其他写位），否则服务账号可替换助手脚本或网关代码提权；`users.json`/`secret` 属主为网关服务账号（0640/0600）。
-- 网关以专用系统账号 `dsh-gateway`（无 shell）运行，**切勿**用 `ubuntu` 等自带 NOPASSWD sudo 的云镜像账号运行网关；其 sudo 能力仅限 `/etc/sudoers.d/dsh-upload` 白名单中的四个文件助手。
-- **回环租户隔离**（`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`）：DSH 实例的特权接口按「Host 头是回环」放行，而所有实例同处 127.0.0.1--任何租户的 agent 都能伪造 Host 直连他人端口窃取 API Key。防护为 iptables OUTPUT 链：每个 `dsh-<name>` 只能连自己的实例端口与网关端口被 REJECT，root/网关账号不受影响。userctl 增删用户自动刷新规则；规则按**目标端口**逐条 REJECT（不可按 uid 全量拒绝，否则会掐断内核回包路径）。
+- **安装树完整性（最关键）**：`/opt/deepseek-harness` 整棵树——含 DSH monorepo 源码（`packages/`、`apps/`、`node_modules/`）与 `.agents/` 技能库——不得带 group/other 写位。所有租户实例**共享执行**这份代码，任何可写点都是跨租户注入点（改共享代码或技能文件 → 以其他租户身份执行 → 窃取其 API Key）。部署/升级后必须自检：`find /opt/deepseek-harness -not -path '*/users*' -perm /022 | wc -l` 输出 0（`users/` 用户目录除外）。
+- `gateway/` 目录保持 `root:dsh-gateway 0770`：网关需要在其内做 tmp+rename 原子写（users.json / secret / state-cwd.json）；目录内代码文件（server/userctl/auth/credentials/static）归 root:root 0644。`bin/` 全部归 root:root。
+- 网关以专用系统账号 `dsh-gateway`（无 shell）运行，**切勿**用 `ubuntu` 等自带 NOPASSWD sudo 的云镜像账号运行网关；其 sudo 能力仅限 `/etc/sudoers.d/dsh-upload` 白名单中的四个文件助手。网关 systemd 单元**不可**设置 `NoNewPrivileges=yes`（会阻断 sudo 调 root 助手，上传/下载/列表全部失效）。
+- **回环租户隔离**（`bin/dsh-loopback-guard` + `units/dsh-loopback-guard.service`）：DSH 实例的特权接口按「Host 头是回环」放行，而所有实例同处 127.0.0.1--任何租户的 agent 都能伪造 Host 直连他人端口窃取 API Key。防护为 iptables OUTPUT 链：每个 `dsh-<name>` 只能连自己的实例端口，其他租户端口与网关端口被 REJECT，root/网关账号不受影响。userctl 增删用户自动刷新规则；规则按**目标端口**逐条 REJECT（不可按 uid 全量拒绝，否则会掐断内核回包路径）。
 - 每用户实例带 systemd 资源限制（TasksMax/MemoryMax/CPUQuota，可经 `DSH_MEM_MAX`/`DSH_CPU_QUOTA` 调整）与内核加固项。
-- 文件助手（dsh-file-put/read/stat/list）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。
+- 文件助手（dsh-file-put/read/stat/list）root 仅做参数字符串校验与身份切换，所有文件操作经 `runuser -u dsh-<name>` 以用户自身身份执行（修复 issue #1 的 TOCTOU 竞态）；助手内的 realpath 前缀校验仅保留退出码语义，不再是安全边界。依赖 util-linux 的 `runuser`。**上传助手为 v2 长度协议**（`BYTES <n>` 头 + 精确字节校验）：网关流式转发请求体，中断/超时/超限的上传会以 exit 6 拒绝提交，不会留下截断文件。
 - 用户凭据文件必须保持仅属主可读（0600）：DSH 启动时会强制检查（`assertOwnerOnly`）。本网关的 root 助手模型天然满足，不要给用户目录添加任何 ACL 读取授权（曾因此触发实例拒绝启动）。
 - 网关与所有实例仅监听 127.0.0.1，公网只暴露 TLS 反代；反代必须**覆盖**（非追加）`X-Forwarded-For` 为 `$remote_addr`（见 nginx 配置），否则攻击者可伪造 XFF 绕过网关 IP 限流。
-- 登录限流为 IP + 账号两级；账号锁定（5 次/15 分钟）本身可被滥用作 DoS，仅靠 IP 级限流与强密码缓解。改密会使 `pwdVer` 递增，所有已签发会话立即失效。
+- 登录限流为 IP + 账号两级；账号锁定（5 次/15 分钟）本身可被滥用作 DoS，仅靠 IP 级限流与强密码缓解。改密会使 `pwdVer` 递增，所有已签发会话立即失效（含无版本号的旧令牌）。
 - `/logout` 仅接受 POST（带 CSRF 双提交校验），防跨站登出。
 - 升级 DSH 后如需客户端行为修补（如 settings 持久化作用域），请自行评估，本仓库不修改 npm 包。
 - 使用时微软的密码自动填充会给左侧工作区目录带来问题，尽量关闭自动填充。

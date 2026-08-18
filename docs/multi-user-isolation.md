@@ -76,7 +76,7 @@ iptables OUTPUT 链 DSH_LOOPBACK_GUARD：
 要点：
 - REJECT 必须按**目标端口**逐条下规则。按 uid 全量 REJECT 会把内核代表该用户实例发出的回包（sport=自己端口）一并掐断，表现为所有租户连接静默超时。
 - root、网关服务账号与普通用户不受影响。
-- 验证：`runuser -u dsh-<user> -- curl http://127.0.0.1:<其他租户端口>/` 应被拒（tcp-reset），连自己的实例端口正常。
+- 验证：`runuser -u dsh-admin -- curl http://127.0.0.1:3102/` 应被拒（tcp-reset），连 3101 正常。
 
 ## 5. 凭据与密钥
 
@@ -95,8 +95,8 @@ H=/opt/deepseek-harness/users/<user>
 # 目录列表
 sudo -n /opt/deepseek-harness/bin/dsh-file-list "$H" ''
 
-# 写入 / 读取 / 统计
-echo hello | sudo -n /opt/deepseek-harness/bin/dsh-file-put "$H" "$H/workspace" t.txt
+# 写入 / 读取 / 统计（v2 长度协议：首行 "BYTES <n>" + 精确 n 字节；短流 exit=6 不落盘）
+printf 'BYTES 6\nhello\n' | sudo -n /opt/deepseek-harness/bin/dsh-file-put "$H" "$H/workspace" t.txt
 sudo -n /opt/deepseek-harness/bin/dsh-file-read  "$H" "$H/workspace/t.txt"   # 输出 hello
 sudo -n /opt/deepseek-harness/bin/dsh-file-stat  "$H" "$H/workspace/t.txt"   # 输出 6
 
@@ -116,7 +116,9 @@ runuser -u dsh-<user> -- curl -s --connect-timeout 3 -o /dev/null -w "%{http_cod
 ## 7. 运维注意
 
 - 网关必须以专用账号 `dsh-gateway`（无 shell、sudo 仅限四个文件助手）运行；切勿用带 NOPASSWD 全量 sudo 的云镜像账号。
-- `bin/`、`gateway/` 目录必须 root:root 0755；`users.json`（0640）/`secret`（0600）属主为 `dsh-gateway`。
+- **整棵安装树不得带 group/other 写位**（含 DSH monorepo 源码、`node_modules/`、`.agents/` 技能库——所有租户实例共享执行这份代码，可写点即跨租户注入点）。自检：`find /opt/deepseek-harness -not -path '*/users*' -perm /022 | wc -l` 必须为 0。
+- `gateway/` 目录 `root:dsh-gateway 0770`（网关做 tmp+rename 原子写），目录内代码文件归 root:root 0644；`users.json`（0640）/`secret`（0600）属主为 `dsh-gateway`。
+- 网关 systemd 单元不可设置 `NoNewPrivileges=yes`（会阻断 sudo 调 root 文件助手）。
 - 不要给用户目录添加任何 ACL 读取授权--DSH 的 `assertOwnerOnly` 检查会拒绝实例启动（曾因此触发）。
 - 自定义安装前缀时，必须同步修改 sudoers 白名单与网关的 `UPLOAD_HELPER` / `FILE_STAT_HELPER` / `FILE_READ_HELPER` / `FILE_LIST_HELPER` 四个环境变量；回环防护的网关端口经 `GW_PORT` 覆盖。
 - 回环防护规则由 `dsh-loopback-guard.service` 开机应用，userctl 增删用户即时刷新；服务器上存在 docker/1Panel 等 nftables 使用方，规则以 iptables-nft 混合模式共存，勿手动 flush `filter` 表。

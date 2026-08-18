@@ -1,9 +1,13 @@
 # 路径模板：默认前缀 /opt/deepseek-harness。自定义安装时执行
 #   sed "s|/opt/deepseek-harness|<你的前缀>|g" units/dsh-gateway.service | sudo tee /etc/systemd/system/dsh-gateway.service
 #
-# 安全说明：网关以专用无 shell 系统账号 dsh-gateway 运行（切勿用 ubuntu/
-# admin 等带 NOPASSWD sudo 的云镜像账号），其 sudo 能力仅限
-# /etc/sudoers.d/dsh-upload 白名单中的四个文件助手。
+# 安全说明：
+# - 网关以专用无 shell 系统账号 dsh-gateway 运行（useradd --system
+#   --no-create-home --shell /usr/sbin/nologin dsh-gateway），切勿用 ubuntu
+#   等自带 NOPASSWD sudo 的云镜像账号；其 sudo 能力仅限
+#   /etc/sudoers.d/dsh-upload 白名单中的四个文件助手。
+# - 不可设置 NoNewPrivileges=yes：网关依赖 sudo 调用 root 文件助手，该
+#   标志会阻止 sudo 提权，导致上传/下载/文件列表全部失效。
 [Unit]
 Description=DeepSeek Harness Auth Gateway
 After=network-online.target
@@ -29,10 +33,9 @@ Environment=SESSION_TTL=43200
 ExecStart=/usr/bin/node /opt/deepseek-harness/gateway/server.cjs
 Restart=on-failure
 RestartSec=3
-# 会话 secret 与上传缓冲常驻内存；限制网关自身的资源占用
+# 会话 secret 常驻内存；sudo 助手的子进程也计入本 cgroup，需为并发留余量
 MemoryMax=1G
-TasksMax=256
-NoNewPrivileges=yes
+TasksMax=512
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
